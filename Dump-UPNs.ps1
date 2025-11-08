@@ -207,7 +207,7 @@ th {background:#f3f3f3}
 
         if ($PSVersionTable.PSVersion.Major -ge 7) {
             Set-Clipboard -AsHtml $html
-            Write-Host "✅ HTML table copied to clipboard. Paste into Outlook."
+            Write-Host "HTML table copied to clipboard. Paste into Outlook."
         } else {
             Add-Type -AssemblyName System.Windows.Forms
             $doc = "<html><body><!--StartFragment-->$html<!--EndFragment--></body></html>"
@@ -218,7 +218,7 @@ th {background:#f3f3f3}
             $endHtml       = $startHtml + $doc.Length
             $hdr = "StartHTML:{0:D10}`r`nEndHTML:{1:D10}`r`nStartFragment:{2:D10}`r`nEndFragment:{3:D10}`r`n" -f $startHtml,$endHtml,$startFragment,$endFragment
             [System.Windows.Forms.Clipboard]::SetText(($pre + $hdr + $doc), [System.Windows.Forms.TextDataFormat]::Html)
-            Write-Host "✅ HTML table copied to clipboard. Paste into Outlook."
+            Write-Host "HTML table copied to clipboard. Paste into Outlook."
         }
     }
     else {
@@ -250,7 +250,7 @@ th {background:#f3f3f3}
 
         if ($PSVersionTable.PSVersion.Major -ge 7) {
             Set-Clipboard -AsHtml $html
-            Write-Host "✅ HTML table copied to clipboard. Paste into Outlook."
+            Write-Host "HTML table copied to clipboard. Paste into Outlook."
         } else {
             Add-Type -AssemblyName System.Windows.Forms
             $doc = "<html><body><!--StartFragment-->$html<!--EndFragment--></body></html>"
@@ -261,7 +261,7 @@ th {background:#f3f3f3}
             $endHtml       = $startHtml + $doc.Length
             $hdr = "StartHTML:{0:D10}`r`nEndHTML:{1:D10}`r`nStartFragment:{2:D10}`r`nEndFragment:{3:D10}`r`n" -f $startHtml,$endHtml,$startFragment,$endFragment
             [System.Windows.Forms.Clipboard]::SetText(($pre + $hdr + $doc), [System.Windows.Forms.TextDataFormat]::Html)
-            Write-Host "✅ HTML table copied to clipboard. Paste into Outlook."
+            Write-Host "HTML table copied to clipboard. Paste into Outlook."
         }
     }
     else {
