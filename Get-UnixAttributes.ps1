@@ -1,3 +1,33 @@
+<#
+.SYNOPSIS
+    Retrieve RFC2307 (Unix) attributes for an Active Directory user.
+
+.DESCRIPTION
+    Looks up an AD user account by email address and displays
+    the Unix-related attributes used for NFS / LDAP integration:
+    uid, uidNumber, gidNumber, gecos, and unixHomeDirectory.
+
+    Accepts input either via:
+      - the -Email flag,
+      - a single positional argument,
+      - or interactive prompt if none provided.
+
+    The script validates the input to ensure it looks like an email address
+    before performing the query.
+
+.EXAMPLES
+    PS C:\> .\Get-UnixAttributes.ps1 -Email alice@example.org
+    PS C:\> .\Get-UnixAttributes.ps1 alice@example.org
+    PS C:\> .\Get-UnixAttributes.ps1
+    (then enter the email address interactively)
+
+.NOTES
+    Requires the ActiveDirectory module (RSAT: Active Directory tools).
+
+.AUTHOR
+    Andrew Davis <andrew.davis@gladstone.ucsf.edu>
+#>
+
  param(
     [string]$Email
 )

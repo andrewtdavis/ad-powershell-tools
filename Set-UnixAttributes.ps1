@@ -1,3 +1,69 @@
+<#
+.SYNOPSIS
+    Create or update Unix / RFC2307 attributes on an AD user.
+
+.DESCRIPTION
+    This script looks up an Active Directory user by email address and ensures
+    the core Unix/RFC2307 attributes are populated:
+
+        - uid
+        - uidNumber
+        - gidNumber
+        - gecos
+        - unixHomeDirectory
+
+    For each attribute:
+      1. If you pass a value on the command line, that value is used.
+      2. Else, if the user already has a value in AD, that existing value is used.
+      3. Else, you are prompted for a value (unless -NonInteractive, in which case it errors).
+
+    The script also:
+      - Shows a preview of what will be applied and marks each field as (NEW) or (MODIFIED).
+      - Special-cases the 'uid' attribute: if the user has a different value or multiple values,
+        it clears 'uid' first and then adds the single desired value. This avoids uid lists.
+
+.PARAMETER Email
+    The email address used to locate the AD user. This is required.
+
+.PARAMETER UnixUsername
+    Value to set for 'uid'. If omitted, the existing AD value is used, or you will be prompted.
+
+.PARAMETER UidNumber
+    Value to set for 'uidNumber'. If omitted, the existing AD value is used, or you will be prompted.
+
+.PARAMETER GidNumber
+    Value to set for 'gidNumber'. If omitted, the existing AD value is used, or you will be prompted.
+
+.PARAMETER Gecos
+    Value to set for 'gecos'. If omitted, the existing AD value is used, or you will be prompted.
+
+.PARAMETER UnixHomeDirectory
+    Value to set for 'unixHomeDirectory'. If omitted, the existing AD value is used, or you will be prompted.
+
+.PARAMETER NonInteractive
+    If supplied, the script will NOT prompt for missing values and will error instead.
+    Useful for automation / pipelines.
+
+.EXAMPLE
+    PS C:\> .\Set-UnixAttributes.ps1 -Email alice@example.org
+    Looks up the user, pulls current values from AD, and prompts for anything missing.
+
+.EXAMPLE
+    PS C:\> .\Set-UnixAttributes.ps1 -Email bob@example.org -UnixHomeDirectory "/home/bob"
+    Updates only the home directory (and will prompt for anything else missing in AD).
+
+.EXAMPLE
+    PS C:\> .\Set-UnixAttributes.ps1 -Email svc@example.org -UnixUsername svcacct -UidNumber 20010 -GidNumber 20010 -Gecos "Service Account" -UnixHomeDirectory "/srv/svcacct" -NonInteractive
+    Fully specifies all values; runs without prompts. Good for CI / automation.
+
+.NOTES
+    - Requires the ActiveDirectory module (RSAT).
+    - The filter below uses 'mail' as the email attribute. If your AD uses 'EmailAddress'
+      instead, change the Get-ADUser filter line accordingly.
+
+.AUTHOR
+    Andrew Davis <andrew.davis@gladstone.ucsf.edu>
+#>
  param(
     [Parameter(Mandatory = $true)]
     [string]$Email,

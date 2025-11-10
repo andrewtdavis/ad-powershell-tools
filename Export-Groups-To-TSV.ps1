@@ -31,6 +31,9 @@
         -SearchDomain "domain2.corp.local" `
         -SearchBase "Service/Groups" `
         -OutputDir "C:\temp\ad-groups"
+
+.AUTHOR
+    Andrew Davis <andrew.davis@gladstone.ucsf.edu>
 #>
 
 param(

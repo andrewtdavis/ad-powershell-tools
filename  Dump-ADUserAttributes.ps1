@@ -31,7 +31,10 @@
 
 .EXAMPLE
     .\Dump-ADUserAttributes.ps1 -User jsmith -Domain example.com -Fields mail,department -OutCsv jsmith.csv
-#>
+
+.AUTHOR
+    Andrew Davis <andrew.davis@gladstone.ucsf.edu>
+ # >
 
 param(
     [Parameter(Mandatory=$false)][Alias("h","help")][switch]$ShowHelp,
