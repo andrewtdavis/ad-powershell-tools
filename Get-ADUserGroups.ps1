@@ -14,7 +14,11 @@
       - Searches every domain in the forest for groups whose 'member' attribute
         contains that user's DN. This captures cross-domain memberships.
 
-    Outputs only status messages and (optionally) a summary table.
+    By default, prints a table of:
+        MembershipGroupName
+        MembershipGroupDN
+        MembershipGroupDomain
+
     Use -OutTsv and -SummaryTsv for machine-readable output.
 
 .PARAMETER Users
@@ -24,7 +28,7 @@
       - DistinguishedName (CN=...,OU=...,DC=...,DC=...)
 
 .PARAMETER Domain
-    Optional: A domain FQDN (e.g. domain.example.com) used as:
+    Optional: A domain FQDN (e.g. corehpc.ucsf.edu) used as:
       - The default place to resolve non-DN user identities.
       - The server for initial forest discovery.
 
@@ -41,16 +45,16 @@
 
 .EXAMPLE
     .\Get-ADUserGroups.ps1 `
-        -Users "jdoe" `
-        -Domain "domain.example.com" `
-        -OutTsv ".\user-groups.tsv" `
-        -Summary `
-        -SummaryTsv ".\user-groups-summary.tsv"
+        -Users "adavis" `
+        -Domain "corehpc.ucsf.edu"
 
 .EXAMPLE
     .\Get-ADUserGroups.ps1 `
-        -Users "jdoe@domain.example.com","CN=Some User,OU=People,DC=domain,DC=example,DC=com" `
-        -Summary
+        -Users "adavis" `
+        -Domain "corehpc.ucsf.edu" `
+        -OutTsv ".\user-groups.tsv" `
+        -Summary `
+        -SummaryTsv ".\user-groups-summary.tsv"
 #>
 
 [CmdletBinding()]
@@ -381,6 +385,12 @@ if (-not $allResults -or $allResults.Count -eq 0) {
 }
 
 Write-Host "Collected $($allResults.Count) membership rows."
+Write-Host ""
+Write-Host "Group memberships:"
+$allResults |
+    Select-Object MembershipGroupName, MembershipGroupDN, MembershipGroupDomain |
+    Sort-Object MembershipGroupDomain, MembershipGroupName |
+    Format-Table -AutoSize
 
 # Optional detailed TSV
 if ($OutTsv) {
