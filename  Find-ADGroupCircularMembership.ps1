@@ -1,4 +1,4 @@
- <#
+<#
 .SYNOPSIS
   Find circular (cyclic) nested group membership starting from a given group.
 
@@ -8,13 +8,20 @@
   such as:
      GroupA -> GroupB -> GroupC -> GroupA
 
-  Cross-domain nested groups are resolved by discovering the group’s domain
-  from its DN and selecting an appropriate DC/GC in that domain.
+  Cross-domain nested groups are resolved by deriving the group’s domain from
+  its DN, then querying an appropriate DC in that domain.
 
-  Notes:
-    - Only group-to-group nesting is considered (users/computers are ignored).
-    - This script explores the membership graph reachable from the start group.
-    - Cycles are de-duplicated by a normalized key.
+  Reliability / scale features:
+    - Retries membership enumeration across multiple DCs per domain.
+    - Falls back to LDAP "member" ranged retrieval if Get-ADGroupMember (ADWS)
+      faults with internal server errors.
+    - Live cycle output and progress reporting.
+    - MaxGroups safety cap.
+
+.NOTES
+  - Only group-to-group nesting is considered (users/computers ignored).
+  - Membership is direct only; recursion is handled by this script so cycles can be detected.
+  - Depth relates to group nesting depth, not users.
 
 .PARAMETER Group
   Group identity: DistinguishedName (DN), sAMAccountName, or Name.
@@ -24,7 +31,19 @@
   when -Group is not a DN.
 
 .PARAMETER MaxDepth
-  Maximum nesting depth to explore (default: 25).
+  Maximum nesting depth to explore (default: 200).
+
+.PARAMETER MaxGroups
+  Maximum unique groups to process before stopping (default: 500000).
+
+.PARAMETER ProgressEvery
+  Update progress after processing this many unique groups (default: 250).
+
+.PARAMETER LiveOutput
+  Emit each discovered cycle immediately to the console.
+
+.PARAMETER NoSummary
+  Suppress end-of-run summary table output.
 
 .PARAMETER IncludeDistributionGroups
   Include distribution groups (GroupCategory=Distribution). By default, only
@@ -34,16 +53,18 @@
   Optional path to write results as TSV.
 
 .PARAMETER PassThru
-  Output objects to the pipeline as well as writing a summary.
+  Output cycle objects to the pipeline (useful for further processing).
 
 .EXAMPLE
-  .\Find-ADGroupCircularMembership.ps1 -Group "Finance-Admins" -Domain "example.com"
+  .\Find-ADGroupCircularMembership.ps1 `
+    -Group "Business Impact Analysis Group" `
+    -Domain "ucsfmedicalcenter.org" `
+    -IncludeDistributionGroups `
+    -MaxDepth 5000 `
+    -MaxGroups 200000 `
+    -ProgressEvery 500 `
+    -LiveOutput
 
-.EXAMPLE
-  .\Find-ADGroupCircularMembership.ps1 -Group "CN=Finance-Admins,OU=Groups,DC=example,DC=com" -Domain example.com -OutTsv .\cycles.tsv
-
-.EXAMPLE
-  .\Find-ADGroupCircularMembership.ps1 -Group "Finance-Admins" -Domain "child.example.com" -MaxDepth 50 -PassThru
 #>
 
 [CmdletBinding()]
@@ -55,8 +76,22 @@ param(
   [string]$Domain,
 
   [Parameter(Mandatory=$false)]
-  [ValidateRange(1,500)]
-  [int]$MaxDepth = 25,
+  [ValidateRange(1,5000)]
+  [int]$MaxDepth = 200,
+
+  [Parameter(Mandatory=$false)]
+  [ValidateRange(1,5000000)]
+  [int]$MaxGroups = 500000,
+
+  [Parameter(Mandatory=$false)]
+  [ValidateRange(1,1000000)]
+  [int]$ProgressEvery = 250,
+
+  [Parameter(Mandatory=$false)]
+  [switch]$LiveOutput,
+
+  [Parameter(Mandatory=$false)]
+  [switch]$NoSummary,
 
   [Parameter(Mandatory=$false)]
   [switch]$IncludeDistributionGroups,
@@ -91,7 +126,6 @@ function Escape-LdapFilterValue {
 
 function Get-DomainFromDN {
   param([Parameter(Mandatory=$true)][string]$DistinguishedName)
-  # Extract DC= parts -> fqdn
   $dcs = @()
   foreach ($part in ($DistinguishedName -split ',')) {
     $p = $part.Trim()
@@ -106,35 +140,20 @@ function Get-ForestDomainMap {
 
   $forest = if ($Server) { Get-ADForest -Server $Server } else { Get-ADForest }
   $map = @{}  # domain fqdn (lower) -> preferred DC hostname
+
   foreach ($d in $forest.Domains) {
     try {
       $dc = Get-ADDomainController -Discover -DomainName $d -Service "PrimaryDC"
       $map[$d.ToLowerInvariant()] = $dc.HostName
     } catch {
-      # Fallback to any DC
       $dc = Get-ADDomainController -Discover -DomainName $d
       $map[$d.ToLowerInvariant()] = $dc.HostName
     }
   }
 
-  $gcs = @()
-  try {
-    if ($forest.GlobalCatalogs) { $gcs = @($forest.GlobalCatalogs) }
-  } catch {}
-
-  if (-not $gcs.Count) {
-    # Try discovering a GC from the root domain
-    try {
-      $root = $forest.RootDomain
-      $gc = Get-ADDomainController -Discover -DomainName $root -Service GlobalCatalog
-      $gcs = @($gc.HostName)
-    } catch {}
-  }
-
   return [pscustomobject]@{
     Forest = $forest
     DomainMap = $map
-    GlobalCatalogs = $gcs
   }
 }
 
@@ -147,9 +166,26 @@ function Get-ServerForDomain {
   $k = $DomainName.ToLowerInvariant()
   if ($DomainMap.ContainsKey($k) -and $DomainMap[$k]) { return $DomainMap[$k] }
 
-  # Last-ditch: try discovery
   $dc = Get-ADDomainController -Discover -DomainName $DomainName
   return $dc.HostName
+}
+
+function Get-DomainControllersForDomain {
+  param([Parameter(Mandatory=$true)][string]$DomainName)
+
+  try {
+    $dcs = Get-ADDomainController -Filter * -Server $DomainName -ErrorAction Stop |
+      Where-Object { $_.HostName } |
+      Select-Object -ExpandProperty HostName
+    if ($dcs) { return @($dcs | Sort-Object -Unique) }
+  } catch {}
+
+  try {
+    $dc = Get-ADDomainController -Discover -DomainName $DomainName -ErrorAction Stop
+    if ($dc -and $dc.HostName) { return @($dc.HostName) }
+  } catch {}
+
+  return @()
 }
 
 function Resolve-Group {
@@ -159,7 +195,7 @@ function Resolve-Group {
     [Parameter(Mandatory=$true)][hashtable]$DomainMap
   )
 
-  # If DN: domain is derived from DN
+  # DN: derive domain from DN
   if ($GroupId -match '(?i)\bDC=') {
     $dom = Get-DomainFromDN -DistinguishedName $GroupId
     if (-not $dom) { throw "Could not derive domain from DN: $GroupId" }
@@ -167,14 +203,12 @@ function Resolve-Group {
     return Get-ADGroup -Identity $GroupId -Server $srv -Properties DistinguishedName,SamAccountName,Name,GroupCategory,GroupScope,ObjectGUID
   }
 
-  # Otherwise: look in DefaultDomain
+  # Otherwise search within provided domain
   $srv = Get-ServerForDomain -DomainName $DefaultDomain -DomainMap $DomainMap
 
-  # Try identity direct
   $g = Get-ADGroup -Identity $GroupId -Server $srv -ErrorAction SilentlyContinue -Properties DistinguishedName,SamAccountName,Name,GroupCategory,GroupScope,ObjectGUID
   if ($g) { return $g }
 
-  # Try search by samAccountName or Name
   $safe = $GroupId.Replace("'", "''")
   $g = Get-ADGroup -Server $srv -Filter "SamAccountName -eq '$safe' -or Name -eq '$safe'" -ErrorAction SilentlyContinue -Properties DistinguishedName,SamAccountName,Name,GroupCategory,GroupScope,ObjectGUID | Select-Object -First 1
   if ($g) { return $g }
@@ -182,28 +216,6 @@ function Resolve-Group {
   throw "Unable to resolve group '$GroupId' in domain '$DefaultDomain' (server $srv)."
 }
 
-function Get-DomainControllersForDomain {
-  param(
-    [Parameter(Mandatory=$true)][string]$DomainName
-  )
-
-  # Prefer writable DCs; keep it simple and retry across several.
-  try {
-    $dcs = Get-ADDomainController -Filter * -Server $DomainName -ErrorAction Stop |
-      Where-Object { $_.HostName } |
-      Select-Object -ExpandProperty HostName
-    if ($dcs) { return @($dcs | Sort-Object -Unique) }
-  } catch {}
-
-  # Last ditch discovery
-  try {
-    $dc = Get-ADDomainController -Discover -DomainName $DomainName -ErrorAction Stop
-    if ($dc -and $dc.HostName) { return @($dc.HostName) }
-  } catch {}
-
-  return @()
-}
-
 function Get-DirectMemberDNsViaLdap {
   param(
     [Parameter(Mandatory=$true)][string]$GroupDN,
@@ -211,7 +223,6 @@ function Get-DirectMemberDNsViaLdap {
     [Parameter(Mandatory=$true)][string]$ServerHost
   )
 
-  # Read group's "member" attribute; support ranged retrieval for big groups.
   $baseDn = ($DomainName.Split('.') | ForEach-Object { "DC=$_" }) -join ','
 
   $root = New-Object System.DirectoryServices.DirectoryEntry("LDAP://$ServerHost/$baseDn")
@@ -224,7 +235,7 @@ function Get-DirectMemberDNsViaLdap {
 
   $members = New-Object 'System.Collections.Generic.List[string]'
 
-  # First try plain "member"; if server returns partials, we range it.
+  # Try normal member first
   $ds.PropertiesToLoad.Clear()
   $null = $ds.PropertiesToLoad.Add("member")
 
@@ -236,7 +247,7 @@ function Get-DirectMemberDNsViaLdap {
     return @($members)
   }
 
-  # Ranged retrieval
+  # Ranged retrieval for big groups
   $start = 0
   $step = 1500
 
@@ -257,93 +268,7 @@ function Get-DirectMemberDNsViaLdap {
 
     foreach ($m in $r.Properties[$propName]) { $members.Add([string]$m) }
 
-    if ($propName -match ';range=\d+-\*$') {
-      break
-    }
-
-    $start += $step
-  }
-
-  return @($members)
-}
-function Get-DomainControllersForDomain {
-  param(
-    [Parameter(Mandatory=$true)][string]$DomainName
-  )
-
-  # Prefer writable DCs; keep it simple and retry across several.
-  try {
-    $dcs = Get-ADDomainController -Filter * -Server $DomainName -ErrorAction Stop |
-      Where-Object { $_.HostName } |
-      Select-Object -ExpandProperty HostName
-    if ($dcs) { return @($dcs | Sort-Object -Unique) }
-  } catch {}
-
-  # Last ditch discovery
-  try {
-    $dc = Get-ADDomainController -Discover -DomainName $DomainName -ErrorAction Stop
-    if ($dc -and $dc.HostName) { return @($dc.HostName) }
-  } catch {}
-
-  return @()
-}
-
-function Get-DirectMemberDNsViaLdap {
-  param(
-    [Parameter(Mandatory=$true)][string]$GroupDN,
-    [Parameter(Mandatory=$true)][string]$DomainName,
-    [Parameter(Mandatory=$true)][string]$ServerHost
-  )
-
-  # Read group's "member" attribute; support ranged retrieval for big groups.
-  $baseDn = ($DomainName.Split('.') | ForEach-Object { "DC=$_" }) -join ','
-
-  $root = New-Object System.DirectoryServices.DirectoryEntry("LDAP://$ServerHost/$baseDn")
-  $ds = New-Object System.DirectoryServices.DirectorySearcher($root)
-
-  $escapedDn = Escape-LdapFilterValue -Value $GroupDN
-  $ds.Filter = "(&(objectClass=group)(distinguishedName=$escapedDn))"
-  $ds.PageSize = 1000
-  $ds.SearchScope = "Subtree"
-
-  $members = New-Object 'System.Collections.Generic.List[string]'
-
-  # First try plain "member"; if server returns partials, we range it.
-  $ds.PropertiesToLoad.Clear()
-  $null = $ds.PropertiesToLoad.Add("member")
-
-  $res = $ds.FindOne()
-  if (-not $res) { return @() }
-
-  if ($res.Properties["member"] -and $res.Properties["member"].Count -gt 0) {
-    foreach ($m in $res.Properties["member"]) { $members.Add([string]$m) }
-    return @($members)
-  }
-
-  # Ranged retrieval
-  $start = 0
-  $step = 1500
-
-  while ($true) {
-    $rangeAttr = "member;range=$start-$($start + $step - 1)"
-
-    $ds.PropertiesToLoad.Clear()
-    $null = $ds.PropertiesToLoad.Add($rangeAttr)
-
-    $r = $ds.FindOne()
-    if (-not $r) { break }
-
-    $propName = $null
-    foreach ($k in $r.Properties.PropertyNames) {
-      if ($k -like "member;range=*") { $propName = $k; break }
-    }
-    if (-not $propName) { break }
-
-    foreach ($m in $r.Properties[$propName]) { $members.Add([string]$m) }
-
-    if ($propName -match ';range=\d+-\*$') {
-      break
-    }
+    if ($propName -match ';range=\d+-\*$') { break }
 
     $start += $step
   }
@@ -363,8 +288,6 @@ function Get-NestedGroupMembers {
   if (-not $dom) { return @() }
 
   $dcCandidates = @()
-
-  # Prefer the mapped DC first if we have one, then the rest of the domain DCs.
   try {
     $preferred = Get-ServerForDomain -DomainName $dom -DomainMap $DomainMap
     if ($preferred) { $dcCandidates += $preferred }
@@ -372,10 +295,9 @@ function Get-NestedGroupMembers {
 
   $dcCandidates += (Get-DomainControllersForDomain -DomainName $dom)
   $dcCandidates = @($dcCandidates | Where-Object { $_ } | Sort-Object -Unique)
-
   if (-not $dcCandidates.Count) { return @() }
 
-  # 1) Try ADWS path via Get-ADGroupMember across DC candidates
+  # 1) Try ADWS / Get-ADGroupMember across DC candidates
   foreach ($srv in $dcCandidates) {
     try {
       $members = Get-ADGroupMember -Identity $dn -Server $srv -ErrorAction Stop
@@ -390,7 +312,6 @@ function Get-NestedGroupMembers {
           $mdom = Get-DomainFromDN -DistinguishedName $mdn
           if (-not $mdom) { continue }
 
-          # Resolve nested group in its own domain (may differ)
           $nestedSrv = Get-ServerForDomain -DomainName $mdom -DomainMap $DomainMap
           $mg = Get-ADGroup -Identity $mdn -Server $nestedSrv -Properties DistinguishedName,SamAccountName,Name,GroupCategory,GroupScope,ObjectGUID -ErrorAction Stop
 
@@ -403,12 +324,11 @@ function Get-NestedGroupMembers {
 
       return $groups
     } catch {
-      # Try next DC
       continue
     }
   }
 
-  # 2) Fallback: pure LDAP read of "member" (direct members only), then resolve groups
+  # 2) Fallback: LDAP member attr (direct), then resolve group objects
   foreach ($srv in $dcCandidates) {
     try {
       $memberDns = Get-DirectMemberDNsViaLdap -GroupDN $dn -DomainName $dom -ServerHost $srv
@@ -472,7 +392,7 @@ $start = Resolve-Group -GroupId $Group -DefaultDomain $Domain -DomainMap $domain
 $allowDist = [bool]$IncludeDistributionGroups
 
 if (-not $allowDist -and $start.GroupCategory -ne "Security") {
-  throw "Start group '$($start.Name)' is not a Security group. Use -IncludeDistributionGroups if you want to traverse distribution groups."
+  throw "Start group '$($start.Name)' is not a Security group. Use -IncludeDistributionGroups to traverse distribution groups."
 }
 
 # Caches
@@ -483,15 +403,15 @@ function Get-ChildrenDnsCached {
   param([Parameter(Mandatory=$true)][object]$GroupObj)
 
   $dn = $GroupObj.DistinguishedName
-  if ($childrenByDn.ContainsKey($dn)) { return $childrenByDn[$dn] }
+  if ($childrenByDn.ContainsKey($dn)) { return @($childrenByDn[$dn]) }
 
   $kids = Get-NestedGroupMembers -GroupObj $GroupObj -DomainMap $domainMap -AllowDistribution $allowDist
   foreach ($k in $kids) { $groupByDn[$k.DistinguishedName] = $k }
   $childrenByDn[$dn] = @($kids | ForEach-Object { $_.DistinguishedName })
-  return $childrenByDn[$dn]
+  return @($childrenByDn[$dn])
 }
 
-# Cycle detection
+# Cycle detection state
 $visited = New-Object 'System.Collections.Generic.HashSet[string]'
 $inStack = New-Object 'System.Collections.Generic.HashSet[string]'
 $path = New-Object 'System.Collections.Generic.List[string]'
@@ -499,11 +419,17 @@ $path = New-Object 'System.Collections.Generic.List[string]'
 $cycleKeys = New-Object 'System.Collections.Generic.HashSet[string]'
 $cycles = New-Object 'System.Collections.Generic.List[object]'
 
+# Shared stats (script scope so DFS updates persist)
+$script:groupsProcessed = 0
+$script:edgesProcessed  = 0
+$script:stopRequested   = $false
+
+# Groups member-of other groups (in-degree > 0), and parent groups that contain other groups
+$script:inDegree = @{}  # childDN -> count
+$script:parentsSeen = New-Object 'System.Collections.Generic.HashSet[string]'
+
 function Normalize-CycleKey {
   param([Parameter(Mandatory=$true)][string[]]$CycleDns)
-  # Create a stable key independent of rotation:
-  # find lexicographically smallest DN and rotate cycle to start there.
-  # CycleDns is expected to end with the repeated start DN.
   $core = $CycleDns[0..($CycleDns.Count-2)]
   $min = $core | Sort-Object | Select-Object -First 1
   $idx = [Array]::IndexOf($core, $min)
@@ -513,7 +439,6 @@ function Normalize-CycleKey {
   for ($i=0; $i -lt $core.Count; $i++) {
     $rot += $core[($idx + $i) % $core.Count]
   }
-  # close it
   $rot += $rot[0]
   return ($rot -join " -> ")
 }
@@ -524,20 +449,31 @@ function DFS {
     [Parameter(Mandatory=$true)][int]$Depth
   )
 
+  if ($script:stopRequested) { return }
   if ($Depth -gt $MaxDepth) { return }
 
   $null = $visited.Add($CurrentDn)
   $null = $inStack.Add($CurrentDn)
   $path.Add($CurrentDn) | Out-Null
 
+  $script:groupsProcessed++
+  if ($script:groupsProcessed -ge $MaxGroups) {
+    $script:stopRequested = $true
+    return
+  }
+
+  if (($script:groupsProcessed % $ProgressEvery) -eq 0) {
+    Write-Progress -Activity "Scanning group nesting for cycles" `
+      -Status ("Processed {0} groups; resolved {1}; edges {2}; member-of {3}; cycles {4}; depth {5}" -f $script:groupsProcessed, $groupByDn.Count, $script:edgesProcessed, $script:inDegree.Count, $cycles.Count, $Depth) `
+      -PercentComplete 0
+  }
+
   if (-not $groupByDn.ContainsKey($CurrentDn)) {
-    # Resolve minimal info if not cached
     $dom = Get-DomainFromDN -DistinguishedName $CurrentDn
     if ($dom) {
       try {
         $srv = Get-ServerForDomain -DomainName $dom -DomainMap $domainMap
-        $g = Get-ADGroup -Identity $CurrentDn -Server $srv -Properties DistinguishedName,SamAccountName,Name,GroupCategory,GroupScope,ObjectGUID
-        $groupByDn[$CurrentDn] = $g
+        $groupByDn[$CurrentDn] = Get-ADGroup -Identity $CurrentDn -Server $srv -Properties DistinguishedName,SamAccountName,Name,GroupCategory,GroupScope,ObjectGUID
       } catch {}
     }
   }
@@ -545,12 +481,25 @@ function DFS {
   $curObj = $groupByDn[$CurrentDn]
   $childDns = @()
   if ($curObj) {
-    $childDns = Get-ChildrenDnsCached -GroupObj $curObj
+    $childDns = @(Get-ChildrenDnsCached -GroupObj $curObj)
+  }
+  $childDns = @($childDns)
+
+  $script:edgesProcessed += $childDns.Count
+
+  # Update stats: in-degree and parent sets
+  foreach ($__c in $childDns) {
+    if ($__c) {
+      $script:parentsSeen.Add($CurrentDn) | Out-Null
+      if ($script:inDegree.ContainsKey($__c)) { $script:inDegree[$__c] = [int]$script:inDegree[$__c] + 1 }
+      else { $script:inDegree[$__c] = 1 }
+    }
   }
 
   foreach ($childDn in $childDns) {
+    if ($script:stopRequested) { break }
+
     if ($inStack.Contains($childDn)) {
-      # Found a back-edge => cycle. Extract from first occurrence of childDn in current path.
       $startIdx = $path.IndexOf($childDn)
       if ($startIdx -ge 0) {
         $cycleDns = @()
@@ -559,7 +508,6 @@ function DFS {
 
         $key = Normalize-CycleKey -CycleDns $cycleDns
         if ($cycleKeys.Add($key)) {
-          # Materialize labels
           $labels = @()
           foreach ($dn in $cycleDns) {
             if (-not $groupByDn.ContainsKey($dn)) {
@@ -578,12 +526,21 @@ function DFS {
             }
           }
 
-          $cycles.Add([pscustomobject]@{
+          $cycleObj = [pscustomobject]@{
             CycleDepth = ($cycleDns.Count - 1)
             CyclePath  = ($labels -join " -> ")
             CycleDNs   = ($cycleDns -join " -> ")
             DetectedAt = (Get-Date).ToString("s")
-          }) | Out-Null
+          }
+
+          $cycles.Add($cycleObj) | Out-Null
+
+          if ($LiveOutput) {
+            $cycleObj | Format-List CycleDepth, CyclePath, DetectedAt
+            Write-Host "----"
+          }
+
+          if ($PassThru) { $cycleObj }
         }
       }
       continue
@@ -594,28 +551,33 @@ function DFS {
     }
   }
 
-  # pop
   $null = $inStack.Remove($CurrentDn)
   $path.RemoveAt($path.Count - 1)
 }
 
-# Prime cache with start
+# Prime cache with start group
 $groupByDn[$start.DistinguishedName] = $start
+
 DFS -CurrentDn $start.DistinguishedName -Depth 1
 
+Write-Progress -Activity "Scanning group nesting for cycles" -Completed
+
 Write-Host ("Start group: {0}" -f (Format-GroupLabel -GroupObj $start))
-Write-Host ("MaxDepth: {0}" -f $MaxDepth)
+Write-Host ("MaxDepth: {0} | MaxGroups: {1} | ProgressEvery: {2}" -f $MaxDepth, $MaxGroups, $ProgressEvery)
+Write-Host ("Processed groups: {0} | resolved groups: {1} | edges: {2} | groups member-of: {3}" -f $script:groupsProcessed, $groupByDn.Count, $script:edgesProcessed, $script:inDegree.Count)
+Write-Host ("Groups that contain other groups: {0}" -f $script:parentsSeen.Count)
+
+if ($script:stopRequested) {
+  Write-Warning ("Stopped early after reaching MaxGroups ({0}). Increase -MaxGroups if you intend to scan further." -f $MaxGroups)
+}
+
 Write-Host ("Cycles found: {0}" -f $cycles.Count)
 
-if ($cycles.Count -gt 0) {
+if (-not $NoSummary -and $cycles.Count -gt 0) {
   $cycles | Sort-Object CycleDepth, CyclePath | Format-Table -AutoSize CycleDepth, CyclePath
 }
 
 if ($OutTsv) {
   Export-Tsv -Rows ($cycles | Sort-Object CycleDepth, CyclePath) -Path $OutTsv
   Write-Host ("Wrote TSV: {0}" -f $OutTsv)
-}
-
-if ($PassThru) {
-  $cycles | Sort-Object CycleDepth, CyclePath
 }
