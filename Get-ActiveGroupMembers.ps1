@@ -9,8 +9,6 @@
 .EXAMPLE
     .\Get-ActiveGroupMembers.ps1 "Domain Users"
 
-.AUTHOR
-    Andrew Davis <andrew.davis@gladstone.ucsf.edu>
 #>
 
 

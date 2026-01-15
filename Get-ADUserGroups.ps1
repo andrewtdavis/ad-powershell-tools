@@ -28,7 +28,7 @@
       - DistinguishedName (CN=...,OU=...,DC=...,DC=...)
 
 .PARAMETER Domain
-    Optional: A domain FQDN (e.g. corehpc.ucsf.edu) used as:
+    Optional: A domain FQDN (e.g. example.com) used as:
       - The default place to resolve non-DN user identities.
       - The server for initial forest discovery.
 
@@ -46,12 +46,12 @@
 .EXAMPLE
     .\Get-ADUserGroups.ps1 `
         -Users "adavis" `
-        -Domain "corehpc.ucsf.edu"
+        -Domain "example.com"
 
 .EXAMPLE
     .\Get-ADUserGroups.ps1 `
         -Users "adavis" `
-        -Domain "corehpc.ucsf.edu" `
+        -Domain "example.com" `
         -OutTsv ".\user-groups.tsv" `
         -Summary `
         -SummaryTsv ".\user-groups-summary.tsv"

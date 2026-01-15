@@ -33,8 +33,6 @@
     Requires: ActiveDirectory module
     Works on: Windows PowerShell 5.1 and PowerShell 7+
 
-.AUTHOR
-    Andrew Davis <andrew.davis@gladstone.ucsf.edu>
  # >
 
 [CmdletBinding()]

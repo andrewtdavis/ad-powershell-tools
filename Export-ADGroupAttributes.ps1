@@ -33,6 +33,7 @@
     .\Export-ADGroupAttributes.ps1 -Group mygroup -Domain example.com -Fields mail,managedBy -OutCsv mygroup.csv
 #>
 
+[CmdletBinding()]
 param(
     [Parameter(Mandatory=$false)][Alias("h","help")][switch]$ShowHelp,
     [Parameter(Mandatory=$true,Position=0)][Alias("User")][string]$Group,
@@ -44,22 +45,8 @@ param(
 )
 
 if ($ShowHelp) {
-    Write-Host @"
-Usage: Export-ADGroupAttributes.ps1 -Group <groupname> -Domain <domain> [options]
-
-Options:
-  -Fields <field1,field2,...>   Limit output to specific attributes
-  -OutCsv <path>                Export results to a CSV file
-  -OutJson <path>               Export results to a JSON file
-  -Credential (Get-Credential)  Use alternate credentials for binding
-  -h, --help                    Show this help message
-
-Examples:
-  .\Export-ADGroupAttributes.ps1 -Group ""Domain Admins"" -Domain example.com
-  .\Export-ADGroupAttributes.ps1 -Group mygroup -Domain dc01.example.com -Fields mail,managedBy
-  .\Export-ADGroupAttributes.ps1 -Group mygroup -Domain example.com -OutCsv group.csv
-"@
-    exit 0
+    Get-Help -Full $MyInvocation.MyCommand.Path
+    return
 }
 
 function Convert-DomainToBaseDN {

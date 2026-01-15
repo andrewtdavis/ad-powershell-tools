@@ -1,6 +1,6 @@
- <#
+<#
 .SYNOPSIS
-    Dump all Active Directory attributes for a specified user in a specified domain.
+    Export Active Directory attributes for a specified user in a specified domain.
 
 .DESCRIPTION
     Retrieves all (or selected) Active Directory attributes for a given user.
@@ -27,15 +27,14 @@
     Optional JSON path.
 
 .EXAMPLE
-    .\Dump-ADUserAttributes.ps1 -User jsmith -Domain example.com
+    .\Export-ADUserAttributes.ps1 -User jsmith -Domain example.com
 
 .EXAMPLE
-    .\Dump-ADUserAttributes.ps1 -User jsmith -Domain example.com -Fields mail,department -OutCsv jsmith.csv
+    .\Export-ADUserAttributes.ps1 -User jsmith -Domain example.com -Fields mail,department -OutCsv jsmith.csv
 
-.AUTHOR
-    Andrew Davis <andrew.davis@gladstone.ucsf.edu>
- # >
+#>
 
+[CmdletBinding()]
 param(
     [Parameter(Mandatory=$false)][Alias("h","help")][switch]$ShowHelp,
     [Parameter(Mandatory=$true,Position=0)][string]$User,
@@ -47,22 +46,8 @@ param(
 )
 
 if ($ShowHelp) {
-    Write-Host @"
-Usage: Dump-ADUserAttributes.ps1 -User <username> -Domain <domain> [options]
-
-Options:
-  -Fields <field1,field2,...>   Limit output to specific attributes
-  -OutCsv <path>                Export results to a CSV file
-  -OutJson <path>               Export results to a JSON file
-  -Credential (Get-Credential)  Use alternate credentials for binding
-  -h, --help                    Show this help message
-
-Examples:
-  .\Dump-ADUserAttributes.ps1 -User jsmith -Domain example.com
-  .\Dump-ADUserAttributes.ps1 -User jsmith -Domain dc01.example.com -Fields mail,title,department
-  .\Dump-ADUserAttributes.ps1 -User jsmith -Domain example.com -OutCsv jsmith.csv
-"@
-    exit 0
+    Get-Help -Full $MyInvocation.MyCommand.Path
+    return
 }
 
 function Convert-DomainToBaseDN {

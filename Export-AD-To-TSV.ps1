@@ -43,8 +43,6 @@
     - Requires the ActiveDirectory module.
     - Recursive expansion is cycle-safe.
 
-.AUTHOR
-    Andrew Davis <andrew.davis@gladstone.ucsf.edu>
 #>
 
 [CmdletBinding()]

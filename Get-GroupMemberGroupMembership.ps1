@@ -28,7 +28,7 @@
         different domains.
 
 .PARAMETER Domain
-    Optional: A domain FQDN (e.g. corehpc.ucsf.edu) used as:
+    Optional: A domain FQDN (e.g. example.com) used as:
       - The default place to resolve non-DN group identities.
       - The server for initial forest discovery.
 
@@ -49,7 +49,7 @@
 .EXAMPLE
     .\Get-GroupMemberGroupMembership.ps1 `
         -Groups "My-Group" `
-        -Domain "corehpc.ucsf.edu" `
+        -Domain "example.com" `
         -OutTsv ".\membership.tsv" `
         -Summary `
         -SummaryTsv ".\membership-summary.tsv"

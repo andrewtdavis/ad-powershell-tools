@@ -62,8 +62,6 @@
     - AD is still needed here to resolve the AD group members that Delinea group profiles refer to.
     - Cache is per-zone, so parent and child zones keep separate entries.
 
-.AUTHOR
-    Andrew Davis <andrew.davis@gladstone.ucsf.edu>
 #>
 
 [CmdletBinding()]

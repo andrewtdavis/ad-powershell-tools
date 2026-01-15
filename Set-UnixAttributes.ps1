@@ -45,28 +45,40 @@
     Useful for automation / pipelines.
 
 .EXAMPLE
-    PS C:\> .\Set-UnixAttributes.ps1 -Email alice@example.org
+    PS C:\> .\Set-UnixAttributes.ps1 -Email alice@example.com
     Looks up the user, pulls current values from AD, and prompts for anything missing.
 
 .EXAMPLE
-    PS C:\> .\Set-UnixAttributes.ps1 -Email bob@example.org -UnixHomeDirectory "/home/bob"
+    PS C:\> .\Set-UnixAttributes.ps1 -Email bob@example.com -UnixHomeDirectory "/home/bob"
     Updates only the home directory (and will prompt for anything else missing in AD).
 
 .EXAMPLE
-    PS C:\> .\Set-UnixAttributes.ps1 -Email svc@example.org -UnixUsername svcacct -UidNumber 20010 -GidNumber 20010 -Gecos "Service Account" -UnixHomeDirectory "/srv/svcacct" -NonInteractive
+    PS C:\> .\Set-UnixAttributes.ps1 -Email svc@example.com -UnixUsername svcacct -UidNumber 20010 -GidNumber 20010 -Gecos "Service Account" -UnixHomeDirectory "/srv/svcacct" -NonInteractive
     Fully specifies all values; runs without prompts. Good for CI / automation.
+
+.PARAMETER EmailAttribute
+    Active Directory attribute used to locate the user by email address.
+    Common values are: mail, EmailAddress.
+
+.PARAMETER Server
+    Optional domain controller or domain DNS name used for the query and updates.
 
 .NOTES
     - Requires the ActiveDirectory module (RSAT).
-    - The filter below uses 'mail' as the email attribute. If your AD uses 'EmailAddress'
-      instead, change the Get-ADUser filter line accordingly.
 
-.AUTHOR
-    Andrew Davis <andrew.davis@gladstone.ucsf.edu>
 #>
- param(
+
+[CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Medium')]
+param(
     [Parameter(Mandatory = $true)]
     [string]$Email,
+
+    [Parameter(Mandatory = $false)]
+    [ValidateSet('mail','EmailAddress')]
+    [string]$EmailAttribute = 'mail',
+
+    [Parameter(Mandatory = $false)]
+    [string]$Server,
 
     [string]$UnixUsername,        # maps to 'uid'
     [string]$UidNumber,           # maps to 'uidNumber'
@@ -77,19 +89,30 @@
     [switch]$NonInteractive       # if set, we error instead of prompting
 )
 
-Import-Module ActiveDirectory
-
-Write-Host "Looking up user by email: $Email"
-
-# adjust 'mail' to 'EmailAddress' if your environment uses that
-$user = Get-ADUser -Filter { mail -eq $Email } -Properties uid,uidNumber,gidNumber,gecos,unixHomeDirectory
-if (-not $user) {
-    Write-Host "User lookup failed. Please check email address."
-    exit 1
+try {
+    if (-not (Get-Module -Name ActiveDirectory -ListAvailable)) {
+        throw "ActiveDirectory module not found. Install RSAT: Active Directory tools."
+    }
+    Import-Module ActiveDirectory -ErrorAction Stop
+}
+catch {
+    Write-Error $_.Exception.Message
+    throw
 }
 
-Write-Host "Found AD account: $($user.SamAccountName)"
-Write-Host ""
+Write-Verbose "Looking up user by $EmailAttribute: $Email"
+
+$ldapFilter = "($EmailAttribute=$Email)"
+$getParams = @{ LDAPFilter = $ldapFilter; Properties = @('uid','uidNumber','gidNumber','gecos','unixHomeDirectory','SamAccountName'); ErrorAction = 'Stop' }
+if ($Server) { $getParams.Server = $Server }
+
+$user = Get-ADUser @getParams
+if (-not $user) {
+    Write-Error "User lookup failed for $EmailAttribute='$Email'."
+    return
+}
+
+Write-Verbose "Found AD account: $($user.SamAccountName)"
 
 # --- helpers ---
 
@@ -160,13 +183,13 @@ $finalUnixHomeDirectory = Get-RequiredValue -Name "unixHomeDirectory"       -Cli
 
 # --- preview with (NEW)/(MODIFIED) ---
 
-Write-Host "Final attribute values to enforce:"
-Write-Host ("  uid:               {0} {1}" -f $finalUid,               (Get-StatusLabel "uid"               $finalUid               $user.uid))
-Write-Host ("  uidNumber:         {0} {1}" -f $finalUidNumber,         (Get-StatusLabel "uidNumber"         $finalUidNumber         $user.uidNumber))
-Write-Host ("  gidNumber:         {0} {1}" -f $finalGidNumber,         (Get-StatusLabel "gidNumber"         $finalGidNumber         $user.gidNumber))
-Write-Host ("  gecos:             {0} {1}" -f $finalGecos,             (Get-StatusLabel "gecos"             $finalGecos             $user.gecos))
-Write-Host ("  unixHomeDirectory: {0} {1}" -f $finalUnixHomeDirectory, (Get-StatusLabel "unixHomeDirectory" $finalUnixHomeDirectory $user.unixHomeDirectory))
-Write-Host ""
+Write-Information -InformationAction Continue "Final attribute values to enforce:"
+Write-Information -InformationAction Continue ("  uid:               {0} {1}" -f $finalUid,               (Get-StatusLabel "uid"               $finalUid               $user.uid))
+Write-Information -InformationAction Continue ("  uidNumber:         {0} {1}" -f $finalUidNumber,         (Get-StatusLabel "uidNumber"         $finalUidNumber         $user.uidNumber))
+Write-Information -InformationAction Continue ("  gidNumber:         {0} {1}" -f $finalGidNumber,         (Get-StatusLabel "gidNumber"         $finalGidNumber         $user.gidNumber))
+Write-Information -InformationAction Continue ("  gecos:             {0} {1}" -f $finalGecos,             (Get-StatusLabel "gecos"             $finalGecos             $user.gecos))
+Write-Information -InformationAction Continue ("  unixHomeDirectory: {0} {1}" -f $finalUnixHomeDirectory, (Get-StatusLabel "unixHomeDirectory" $finalUnixHomeDirectory $user.unixHomeDirectory))
+Write-Information -InformationAction Continue ""
 
 if (-not $NonInteractive) {
     $confirm = Read-Host "If correct, press Y to continue"
@@ -220,6 +243,6 @@ if ($clear.Count -gt 0 -and $add.Count -gt 0) {
     Set-ADUser -Identity $user -Replace $replace
 }
 
-Write-Host "`nResult:"
+Write-Information -InformationAction Continue "`nResult:"
 Get-ADUser -Identity $user -Properties uid,uidNumber,gidNumber,gecos,unixHomeDirectory |
     Select-Object Name, UserPrincipalName, uid, uidNumber, gidNumber, gecos, unixHomeDirectory

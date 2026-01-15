@@ -58,7 +58,7 @@
 .EXAMPLE
   .\Find-ADGroupCircularMembership.ps1 `
     -Group "Business Impact Analysis Group" `
-    -Domain "ucsfmedicalcenter.org" `
+    -Domain "example.com" `
     -IncludeDistributionGroups `
     -MaxDepth 5000 `
     -MaxGroups 200000 `
