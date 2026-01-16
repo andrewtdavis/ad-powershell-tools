@@ -6,12 +6,33 @@ The repository is designed to be environment-agnostic. Examples use `example.com
 
 ## Prerequisites
 
-### Active Directory
+### Active Directory (RSAT / ActiveDirectory module)
 
-Most scripts require the **ActiveDirectory** module (RSAT).
+Most scripts require the **ActiveDirectory** PowerShell module (RSAT).
 
-- Windows 11: install **RSAT: Active Directory Domain Services and Lightweight Directory Services Tools**
-- Then verify:
+Install methods on Windows 11/10:
+
+**Option 1: Settings UI**
+
+1. Settings -> Apps -> Optional features
+2. Select View features (or Add an optional feature)
+3. Search for RSAT and install **RSAT: Active Directory Domain Services and Lightweight Directory Services Tools**
+
+**Option 2: PowerShell (recommended for automation)**
+
+List RSAT features and current state:
+
+```powershell
+Get-WindowsCapability -Online -Name RSAT* | Select-Object -Property DisplayName, Name, State
+```
+
+Install the AD DS / AD LDS tools (includes the ActiveDirectory module and ADUC MMC snap-in):
+
+```powershell
+Add-WindowsCapability -Online -Name Rsat.ActiveDirectory.DS-LDS.Tools~~~~0.0.1.0
+```
+
+Verify:
 
 ```powershell
 Get-Module -ListAvailable ActiveDirectory
@@ -67,7 +88,11 @@ Get-Help .\Export-AD-To-TSV.ps1 -Examples
 ### Group membership and troubleshooting
 
 - `Get-ActiveGroupMembers.ps1`
-  - Cross-domain aware export of active users in a group.
+  - Enumerates active user accounts in a group and supports cross-domain resolution.
+  - Default output: `SamAccountName` values only (sorted, unique).
+  - Structured output: use `-Name`, `-Email`, and/or `-Attributes` to add columns.
+  - Export formats: `-Csv` or `-Tsv` (mutually exclusive). TSV output includes quoting for fields that contain tabs/newlines/quotes.
+  - Domain targeting: `-Domains` controls where group resolution occurs and provides a fallback list for member resolution.
 
 - `Get-ADUserGroups.ps1`
   - Enumerates group memberships for one or more users, including cross-domain scenarios.
