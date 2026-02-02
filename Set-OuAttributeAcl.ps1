@@ -1,9 +1,9 @@
 <#
 .SYNOPSIS
-Delegates read-only or read-write permissions for specific attributes on an OU to a user or group.
+Delegates read-only or read-write permissions for specific attributes on an OU to a user or group, with an interactive confirmation gate.
 
 .DESCRIPTION
-Updates the security descriptor (ACL) on a target OU so a specified principal (user or group) can read
+Builds a change plan (the ACEs that will be added) for a target OU so a specified principal (user or group) can read
 and optionally write a specified list of attributes (for example RFC2307 attributes).
 
 The script grants permissions on:
@@ -14,19 +14,19 @@ Permissions granted:
   - ReadProperty on specified attributes (both modes)
   - WriteProperty on specified attributes (only with -ReadWrite)
 
-Principal resolution:
-  - Resolves to either an AD group or AD user and uses the principal SID in ACEs.
-  - Default behavior prefers resolving as a group first when names are ambiguous.
-  - -PreferUser flips the resolution order.
+Before making changes, the script prints the exact ACEs that will be added and prompts for confirmation.
+To skip prompting (batch execution), use -Force or run with -Confirm:$false.
 
-Requirements:
-  - RSAT Active Directory module (Import-Module ActiveDirectory)
-  - Execution context must have rights to modify OU permissions
+Notes:
+  - Requires the ActiveDirectory module (RSAT).
+  - Must be run by an account that can modify permissions on the target OU.
+  - Attribute names are resolved to schema attribute GUIDs using the domain schema.
+  - Existing matching ACEs are detected to avoid duplicates.
 
 .PARAMETER Principal
 Identity of the user or group to delegate to.
 Recommended formats:
-  - SamAccountName (common for groups like ATTR_RW_UNIX_RFC2307)
+  - SamAccountName
   - Distinguished Name
   - UPN (for users)
   - DOMAIN\Name (best-effort)
@@ -36,6 +36,9 @@ DNS name of the AD domain. Example: corp.example.com
 
 .PARAMETER OU
 OU distinguished-name fragment under the domain, or a full DN.
+Examples:
+  - "OU=Service Accounts,OU=Identity"
+  - "OU=Service Accounts,OU=Identity,DC=corp,DC=example,DC=com"
 
 .PARAMETER Attribute
 Comma-separated list of attribute LDAP display names.
@@ -56,6 +59,10 @@ Prefer resolving Principal as a user first.
 .PARAMETER DryRun
 Show intended changes but do not modify ACLs.
 
+.PARAMETER Force
+Skip the interactive confirmation prompt and proceed with changes.
+Equivalent to common "batch" behavior.
+
 .EXAMPLE
 .\Set-OuAttributeAcl.ps1 `
   -Principal "ATTR_RW_UNIX_RFC2307" `
@@ -72,9 +79,18 @@ Show intended changes but do not modify ACLs.
   -Attribute "gladstone-UCSFID" `
   -ReadWrite `
   -DryRun
+
+.EXAMPLE
+.\Set-OuAttributeAcl.ps1 `
+  -Principal "ATTR_RW_UNIX_RFC2307" `
+  -Domain "corp.example.com" `
+  -OU "OU=Linux,OU=Service Accounts" `
+  -Attribute "uidNumber" `
+  -ReadWrite `
+  -Force
 #>
 
-[CmdletBinding(SupportsShouldProcess = $true, DefaultParameterSetName = 'ReadOnly')]
+[CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'High', DefaultParameterSetName = 'ReadOnly')]
 param(
   [Parameter(Mandatory = $true)]
   [string]$Principal,
@@ -102,7 +118,9 @@ param(
   [Parameter(ParameterSetName = 'ReadWrite')]
   [switch]$PreferUser,
 
-  [switch]$DryRun
+  [switch]$DryRun,
+
+  [switch]$Force
 )
 
 Set-StrictMode -Version Latest
@@ -269,9 +287,8 @@ function Set-ObjectAcl {
   }
 }
 
-function Add-AttributeAce {
+function New-AttributeRule {
   param(
-    [Parameter(Mandatory = $true)][System.DirectoryServices.ActiveDirectorySecurity]$Acl,
     [Parameter(Mandatory = $true)][System.Security.Principal.SecurityIdentifier]$Sid,
     [Parameter(Mandatory = $true)][Guid]$AttributeGuid,
     [Parameter(Mandatory = $true)][System.DirectoryServices.ActiveDirectoryRights]$Rights
@@ -280,10 +297,53 @@ function Add-AttributeAce {
   $inheritanceType = [System.DirectoryServices.ActiveDirectorySecurityInheritance]::All
   $accessType = [System.Security.AccessControl.AccessControlType]::Allow
 
-  $rule = New-Object System.DirectoryServices.ActiveDirectoryAccessRule `
+  New-Object System.DirectoryServices.ActiveDirectoryAccessRule `
     -ArgumentList $Sid, $Rights, $accessType, $AttributeGuid, $inheritanceType
+}
 
-  $Acl.AddAccessRule($rule) | Out-Null
+function Rule-Equals {
+  param(
+    [Parameter(Mandatory = $true)][System.DirectoryServices.ActiveDirectoryAccessRule]$A,
+    [Parameter(Mandatory = $true)][System.DirectoryServices.ActiveDirectoryAccessRule]$B
+  )
+
+  return (
+    $A.IdentityReference -eq $B.IdentityReference -and
+    $A.ActiveDirectoryRights -eq $B.ActiveDirectoryRights -and
+    $A.AccessControlType -eq $B.AccessControlType -and
+    $A.ObjectType -eq $B.ObjectType -and
+    $A.InheritanceType -eq $B.InheritanceType -and
+    $A.InheritedObjectType -eq $B.InheritedObjectType -and
+    $A.IsInherited -eq $false -and
+    $B.IsInherited -eq $false
+  )
+}
+
+function Confirm-Plan {
+  param(
+    [Parameter(Mandatory = $true)][object[]]$PlanRows,
+    [Parameter(Mandatory = $true)][switch]$SkipPrompt
+  )
+
+  Write-Info ""
+  Write-Info "Planned ACE additions:"
+  Write-Info "----------------------"
+
+  $PlanRows |
+    Sort-Object Rights, AttributeName |
+    Format-Table -AutoSize OU, Principal, Rights, AttributeName, AttributeGuid, Inheritance |
+    Out-String |
+    ForEach-Object { Write-Host $_.TrimEnd() }
+
+  if ($SkipPrompt) {
+    Write-Info "Confirmation: skipped (-Force specified)."
+    return
+  }
+
+  $resp = Read-Host "Proceed with these ACL changes? Type YES to continue"
+  if ($resp -ne 'YES') {
+    throw "Aborted by operator."
+  }
 }
 
 # Main
@@ -330,7 +390,6 @@ Write-Info "Resolved DN:     $($principalObj.DN)"
 Write-Info "Resolved SID:    $($principalObj.SID)"
 Write-Info "Attributes:      $($attrList -join ', ')"
 Write-Info "Mode:            $(if ($ReadWrite) { 'read-write' } else { 'read-only' })"
-Write-Info ""
 
 # Resolve attribute GUIDs
 $guidMap = Get-SchemaAttributeGuidMap -Server $Domain
@@ -350,23 +409,77 @@ if ($missing.Count -gt 0) {
   throw "One or more attributes were not found in schema by lDAPDisplayName: $($missing -join ', ')"
 }
 
-# Update ACL
+# Build the change plan and avoid duplicates
 $acl = Get-ObjectAcl -DistinguishedName $ouDn
 
 $readRight  = [System.DirectoryServices.ActiveDirectoryRights]::ReadProperty
 $writeRight = [System.DirectoryServices.ActiveDirectoryRights]::WriteProperty
 
+$plan = @()
+$rulesToAdd = @()
+
 foreach ($r in $resolved) {
-  Write-Info "Adding ACE: ReadProperty on '$($r.Name)' ($($r.Guid)) - inherited to descendants"
-  Add-AttributeAce -Acl $acl -Sid $principalObj.SID -AttributeGuid $r.Guid -Rights $readRight
+  $readRule = New-AttributeRule -Sid $principalObj.SID -AttributeGuid $r.Guid -Rights $readRight
+  $wantRead = $true
+  foreach ($existing in $acl.GetAccessRules($true, $false, [System.Security.Principal.SecurityIdentifier])) {
+    if ($existing -is [System.DirectoryServices.ActiveDirectoryAccessRule] -and (Rule-Equals -A $existing -B $readRule)) {
+      $wantRead = $false
+      break
+    }
+  }
+
+  if ($wantRead) {
+    $rulesToAdd += $readRule
+    $plan += [PSCustomObject]@{
+      OU            = $ouDn
+      Principal     = "$($principalObj.Type):$($principalObj.Name)"
+      Rights        = 'ReadProperty'
+      AttributeName = $r.Name
+      AttributeGuid = $r.Guid
+      Inheritance   = 'All (this OU and descendants)'
+    }
+  }
 
   if ($ReadWrite) {
-    Write-Info "Adding ACE: WriteProperty on '$($r.Name)' ($($r.Guid)) - inherited to descendants"
-    Add-AttributeAce -Acl $acl -Sid $principalObj.SID -AttributeGuid $r.Guid -Rights $writeRight
+    $writeRule = New-AttributeRule -Sid $principalObj.SID -AttributeGuid $r.Guid -Rights $writeRight
+    $wantWrite = $true
+    foreach ($existing in $acl.GetAccessRules($true, $false, [System.Security.Principal.SecurityIdentifier])) {
+      if ($existing -is [System.DirectoryServices.ActiveDirectoryAccessRule] -and (Rule-Equals -A $existing -B $writeRule)) {
+        $wantWrite = $false
+        break
+      }
+    }
+
+    if ($wantWrite) {
+      $rulesToAdd += $writeRule
+      $plan += [PSCustomObject]@{
+        OU            = $ouDn
+        Principal     = "$($principalObj.Type):$($principalObj.Name)"
+        Rights        = 'WriteProperty'
+        AttributeName = $r.Name
+        AttributeGuid = $r.Guid
+        Inheritance   = 'All (this OU and descendants)'
+      }
+    }
   }
 }
 
+if ($plan.Count -eq 0) {
+  Write-Info ""
+  Write-Info "No changes required. Matching explicit ACEs already exist."
+  return
+}
+
+# Interactive confirmation unless -Force is specified
+Confirm-Plan -PlanRows $plan -SkipPrompt:$Force
+
+# Apply changes
 Write-Info ""
 Write-Info "Applying ACL changes to OU..."
+
+foreach ($rule in $rulesToAdd) {
+  $acl.AddAccessRule($rule) | Out-Null
+}
+
 Set-ObjectAcl -DistinguishedName $ouDn -Acl $acl
 Write-Info "Done."
