@@ -1,34 +1,41 @@
 <#
 .SYNOPSIS
-Reports attribute-level ACLs on an OU and (optionally) evaluates whether a given principal has effective access.
+Reports attribute-level ACLs on an OU, including well-known identities, common domain admin groups (known RIDs),
+and broader rights that imply read/write access or the ability to grant access.
 
 .DESCRIPTION
-Reads the security descriptor (ACL) on a target OU and reports Access Control Entries (ACEs) that grant
-ReadProperty and/or WriteProperty for specific attribute GUIDs.
+Reads the security descriptor (DACL) on a target OU and reports allow ACEs that can result in effective
+ReadProperty and/or WriteProperty access for specific attributes.
 
-Two usage modes are supported:
+This script supports two modes:
 
-1) Principal mode (default when -Principal is provided)
-   - For each requested attribute, determines whether the principal has effective access through:
-     - direct ACEs on the OU
-     - group membership (including nested groups)
-     - inherited ACEs (where applicable)
-   - Also lists the identities (users/groups) that grant access for each attribute so it is obvious which
-     principals currently provide the permission.
+1) Discovery mode (no -Principal)
+   - Lists identities on the OU ACL (including inherited if enabled) that grant access for each requested attribute.
+   - Includes:
+     - attribute-specific ACEs (ObjectType = attribute GUID)
+     - "all properties" ACEs (ObjectType = empty GUID) with ReadProperty/WriteProperty
+     - broader rights that imply access (GenericAll, GenericWrite, GenericRead)
+     - rights that allow granting access (WriteDacl, WriteOwner)
 
-2) Discovery mode (when -Principal is omitted)
-   - For each requested attribute, lists all identities that have access at the OU and indicates whether
-     each ACE is inherited.
+2) Principal evaluation mode (-Principal provided)
+   - Evaluates whether the principal can read/write the attribute through:
+     - direct ACEs
+     - group membership (nested groups)
+     - inherited ACEs (if enabled)
+   - Also shows which identities provide that access, plus which identities on the ACL provide access in general.
 
-Notes:
-  - Requires RSAT Active Directory module.
-  - This script reads permissions only. It does not modify ACLs.
-  - Evaluation uses the OU DACL and performs SID expansion for identity references.
-  - This script does not compute complex Windows "effective access" across multiple objects, denies,
-    or Central Access Policies. It focuses on OU-level allow ACEs for attribute ReadProperty/WriteProperty.
+Identity name resolution:
+  - Well-known SIDs are mapped (Everyone, Authenticated Users, etc).
+  - Known RID groups are labeled (Domain Admins - 512, etc) based on domain SID (and forest root SID for Enterprise Admins).
+  - Otherwise uses SID.Translate(NTAccount) and falls back to SID string.
+
+Important limitations:
+  - Deny ACEs are reported (optionally) but are not used to compute a full Windows "effective access" result.
+  - Central Access Policies, claims-based auth, and permissions derived from other objects are not evaluated.
+  - "Can grant access" (WriteDacl/WriteOwner) indicates potential ability, not immediate attribute access without an ACL change.
 
 .PARAMETER Principal
-Optional. Identity of the user or group to evaluate. If omitted, all matching ACEs are reported.
+Optional. Identity of the user or group to evaluate (user or group). If omitted, discovery mode is used.
 
 .PARAMETER Domain
 DNS name of the AD domain. Example: corp.example.com
@@ -44,48 +51,44 @@ Comma-separated list of attribute LDAP display names.
 Example: "uid,uidNumber,gidNumber,unixHomeDirectory,loginShell"
 
 .PARAMETER ReadOnly
-Report only ReadProperty ACEs (and evaluate read access if -Principal is provided).
+Report and evaluate ReadProperty only (but still shows grant-capable rights if enabled).
 
 .PARAMETER ReadWrite
-Report both ReadProperty and WriteProperty ACEs (and evaluate both if -Principal is provided).
+Report and evaluate both ReadProperty and WriteProperty (and grant-capable rights if enabled).
 
 .PARAMETER PreferGroup
-Prefer resolving Principal as a group first (default).
+Prefer resolving Principal as a group first (default when ambiguous).
 
 .PARAMETER PreferUser
 Prefer resolving Principal as a user first.
 
 .PARAMETER IncludeInherited
-Include inherited ACEs in the report and evaluation. Default is enabled.
+Include inherited ACEs in reporting and evaluation. Default: enabled.
+
+.PARAMETER IncludeDeny
+Include Deny ACEs in reporting output. Default: disabled.
+
+.PARAMETER IncludeGrantCapable
+Include rights that allow granting access (WriteDacl/WriteOwner). Default: enabled.
 
 .PARAMETER Raw
-Output raw ACE objects (unformatted). Useful for further filtering/piping.
+Output raw rows (objects) instead of formatted tables.
 
 .EXAMPLE
-# Evaluate whether a group has read/write access, and show which identities currently grant that access.
-.\Get-OUAttributeAcl.ps1 `
-  -Principal "ATTR_RW_UNIX_RFC2307" `
-  -Domain "corp.example.com" `
-  -OU "OU=Linux,OU=Service Accounts" `
-  -Attribute "uid,uidNumber,gidNumber" `
-  -ReadWrite
+# Discovery mode: who has read/write access (direct or implied) for these attributes on the OU
+.\Get-OuAttributeAcl.ps1 -Domain test.com -OU "OU=Accounts,OU=Gladstone" -Attribute "uid,uidNumber,gidNumber" -ReadWrite
 
 .EXAMPLE
-# Discovery mode: list all identities with read access for an attribute on the OU.
-.\Get-OUAttributeAcl.ps1 `
-  -Domain "corp.example.com" `
-  -OU "OU=Linux,OU=Service Accounts" `
-  -Attribute "uidNumber" `
-  -ReadOnly
+# Principal mode: does this group have access, and via which ACE identities
+.\Get-OuAttributeAcl.ps1 -Principal "ATTR_RW_UNIX_RFC2307" -Domain test.com -OU "OU=Linux,OU=Service Accounts" -Attribute "uidNumber" -ReadWrite
 
 .EXAMPLE
-# Raw output for custom processing.
-.\Get-OUAttributeAcl.ps1 `
-  -Domain "corp.example.com" `
-  -OU "OU=Linux,OU=Service Accounts" `
-  -Attribute "uidNumber" `
-  -ReadWrite `
-  -Raw
+# Include deny entries in the output
+.\Get-OuAttributeAcl.ps1 -Domain test.com -OU "OU=Accounts,OU=Gladstone" -Attribute "uidNumber" -ReadWrite -IncludeDeny
+
+.EXAMPLE
+# Raw output
+.\Get-OuAttributeAcl.ps1 -Domain test.com -OU "OU=Accounts,OU=Gladstone" -Attribute "uidNumber" -ReadWrite -Raw
 #>
 
 [CmdletBinding(DefaultParameterSetName = 'ReadOnly')]
@@ -117,6 +120,10 @@ param(
   [switch]$PreferUser,
 
   [switch]$IncludeInherited = $true,
+
+  [switch]$IncludeDeny,
+
+  [switch]$IncludeGrantCapable = $true,
 
   [switch]$Raw
 )
@@ -153,9 +160,7 @@ function Normalize-OuDn {
     [Parameter(Mandatory = $true)][string]$DomainDn
   )
 
-  if ($OuInput -match '(?i)\bDC=') {
-    return $OuInput
-  }
+  if ($OuInput -match '(?i)\bDC=') { return $OuInput }
 
   $trimmed = $OuInput.Trim().TrimEnd(',')
   if (-not ($trimmed -match '(?i)^\s*OU=')) {
@@ -173,53 +178,29 @@ function Resolve-Principal {
   )
 
   $idToTry = @($Identity)
-
-  if ($Identity -match '^[^\\]+\\[^\\]+$') {
-    $idToTry += $Identity.Split('\', 2)[1]
-  }
-
+  if ($Identity -match '^[^\\]+\\[^\\]+$') { $idToTry += $Identity.Split('\', 2)[1] }
   $idToTry = @($idToTry | Where-Object { $_ -and $_.Trim() -ne '' } | Select-Object -Unique)
 
   foreach ($id in $idToTry) {
     if ($Order -eq 'GroupFirst') {
       try {
         $g = Get-ADGroup -Server $Server -Identity $id -Properties objectSid, distinguishedName, samAccountName -ErrorAction Stop
-        return [PSCustomObject]@{
-          Type = 'Group'
-          Name = $g.SamAccountName
-          DN   = $g.DistinguishedName
-          SID  = $g.SID
-        }
+        return [PSCustomObject]@{ Type = 'Group'; Name = $g.SamAccountName; DN = $g.DistinguishedName; SID = $g.SID }
       } catch { }
 
       try {
         $u = Get-ADUser -Server $Server -Identity $id -Properties objectSid, distinguishedName, samAccountName -ErrorAction Stop
-        return [PSCustomObject]@{
-          Type = 'User'
-          Name = $u.SamAccountName
-          DN   = $u.DistinguishedName
-          SID  = $u.SID
-        }
+        return [PSCustomObject]@{ Type = 'User'; Name = $u.SamAccountName; DN = $u.DistinguishedName; SID = $u.SID }
       } catch { }
     } else {
       try {
         $u = Get-ADUser -Server $Server -Identity $id -Properties objectSid, distinguishedName, samAccountName -ErrorAction Stop
-        return [PSCustomObject]@{
-          Type = 'User'
-          Name = $u.SamAccountName
-          DN   = $u.DistinguishedName
-          SID  = $u.SID
-        }
+        return [PSCustomObject]@{ Type = 'User'; Name = $u.SamAccountName; DN = $u.DistinguishedName; SID = $u.SID }
       } catch { }
 
       try {
         $g = Get-ADGroup -Server $Server -Identity $id -Properties objectSid, distinguishedName, samAccountName -ErrorAction Stop
-        return [PSCustomObject]@{
-          Type = 'Group'
-          Name = $g.SamAccountName
-          DN   = $g.DistinguishedName
-          SID  = $g.SID
-        }
+        return [PSCustomObject]@{ Type = 'Group'; Name = $g.SamAccountName; DN = $g.DistinguishedName; SID = $g.SID }
       } catch { }
     }
   }
@@ -259,27 +240,77 @@ function Get-ObjectAcl {
   }
 }
 
-function Try-ResolveSidToName {
+function Get-KnownSidLabelMap {
   param(
-    [Parameter(Mandatory = $true)][System.Security.Principal.SecurityIdentifier]$Sid,
     [Parameter(Mandatory = $true)][string]$Server
   )
 
-  # Best-effort AD resolution. Returns a friendly string even if resolution fails.
+  # Well-known SIDs (not domain-specific)
+  $map = @{
+    'S-1-1-0'      = 'Everyone'
+    'S-1-5-11'     = 'Authenticated Users'
+    'S-1-5-10'     = 'SELF'
+    'S-1-5-18'     = 'LOCAL SYSTEM'
+    'S-1-5-32-544' = 'BUILTIN\Administrators'
+    'S-1-5-32-545' = 'BUILTIN\Users'
+    'S-1-5-32-546' = 'BUILTIN\Guests'
+    'S-1-5-32-551' = 'BUILTIN\Backup Operators'
+    'S-1-5-32-548' = 'BUILTIN\Account Operators'
+    'S-1-5-32-549' = 'BUILTIN\Server Operators'
+    'S-1-5-32-550' = 'BUILTIN\Print Operators'
+  }
+
+  # Domain and forest root well-known RIDs (domain-specific groups)
+  $domainSid = $null
+  $forestRootSid = $null
+
   try {
-    $o = Get-ADObject -Server $Server -Identity $Sid.Value -Properties objectClass, samAccountName -ErrorAction Stop
-    if ($o.objectClass -contains 'group') {
-      return "Group:$($o.samAccountName)"
+    $d = Get-ADDomain -Server $Server -ErrorAction Stop
+    $domainSid = $d.DomainSID.Value
+  } catch { }
+
+  try {
+    $f = Get-ADForest -Server $Server -ErrorAction Stop
+    if ($f.RootDomain) {
+      $rd = Get-ADDomain -Server $f.RootDomain -ErrorAction Stop
+      $forestRootSid = $rd.DomainSID.Value
     }
-    if ($o.objectClass -contains 'user') {
-      return "User:$($o.samAccountName)"
-    }
-    if ($o.samAccountName) {
-      return "$($o.objectClass):$($o.samAccountName)"
-    }
-    return $Sid.Value
+  } catch { }
+
+  if ($domainSid) {
+    $map["$domainSid-512"] = 'Domain Admins (RID 512)'
+    $map["$domainSid-513"] = 'Domain Users (RID 513)'
+    $map["$domainSid-514"] = 'Domain Guests (RID 514)'
+    $map["$domainSid-515"] = 'Domain Computers (RID 515)'
+    $map["$domainSid-516"] = 'Domain Controllers (RID 516)'
+    $map["$domainSid-517"] = 'Cert Publishers (RID 517)'
+    $map["$domainSid-518"] = 'Schema Admins (RID 518) [domain]'
+    $map["$domainSid-519"] = 'Enterprise Admins (RID 519) [domain]'
+    $map["$domainSid-520"] = 'Group Policy Creator Owners (RID 520)'
+    $map["$domainSid-544"] = 'Administrators (RID 544) [domain local]'
+  }
+
+  if ($forestRootSid) {
+    $map["$forestRootSid-518"] = 'Schema Admins (RID 518) [forest root]'
+    $map["$forestRootSid-519"] = 'Enterprise Admins (RID 519) [forest root]'
+  }
+
+  return $map
+}
+
+function Resolve-SidFriendly {
+  param(
+    [Parameter(Mandatory = $true)][System.Security.Principal.SecurityIdentifier]$Sid,
+    [Parameter(Mandatory = $true)][hashtable]$KnownSidLabels
+  )
+
+  $sidStr = $Sid.Value
+  if ($KnownSidLabels.ContainsKey($sidStr)) { return $KnownSidLabels[$sidStr] }
+
+  try {
+    return ($Sid.Translate([System.Security.Principal.NTAccount])).Value
   } catch {
-    return $Sid.Value
+    return $sidStr
   }
 }
 
@@ -289,68 +320,123 @@ function Get-PrincipalTokenSids {
     [Parameter(Mandatory = $true)][string]$Server
   )
 
-  # Returns SIDs that can grant access: the principal SID and (if user) group SIDs.
-  $sidList = New-Object System.Collections.Generic.HashSet[string]
-  $null = $sidList.Add($PrincipalObj.SID.Value)
+  $set = New-Object System.Collections.Generic.HashSet[string]
+  $null = $set.Add($PrincipalObj.SID.Value)
 
   if ($PrincipalObj.Type -eq 'User') {
     $u = Get-ADUser -Server $Server -Identity $PrincipalObj.DN -Properties tokenGroups -ErrorAction Stop
     foreach ($tg in $u.tokenGroups) {
-      $null = $sidList.Add(([System.Security.Principal.SecurityIdentifier]$tg).Value)
+      $null = $set.Add(([System.Security.Principal.SecurityIdentifier]$tg).Value)
     }
-  } elseif ($PrincipalObj.Type -eq 'Group') {
-    # tokenGroups not available for groups. Expand nested group membership and add those group SIDs.
-    $groupDns = @($PrincipalObj.DN)
+  } else {
+    # For groups, approximate "token-like" SIDs by including nested groups.
+    $dns = @($PrincipalObj.DN)
     try {
-      $nested = Get-ADGroupMember -Server $Server -Identity $PrincipalObj.DN -Recursive -ErrorAction Stop |
+      $nestedDns = Get-ADGroupMember -Server $Server -Identity $PrincipalObj.DN -Recursive -ErrorAction Stop |
         Where-Object { $_.objectClass -eq 'group' } |
         Select-Object -ExpandProperty DistinguishedName
-      $groupDns += $nested
+      $dns += $nestedDns
     } catch { }
 
-    $groupDns = @($groupDns | Select-Object -Unique)
-
-    foreach ($dn in $groupDns) {
+    $dns = @($dns | Select-Object -Unique)
+    foreach ($dn in $dns) {
       try {
         $g = Get-ADGroup -Server $Server -Identity $dn -Properties objectSid -ErrorAction Stop
-        $null = $sidList.Add($g.SID.Value)
+        $null = $set.Add($g.SID.Value)
       } catch { }
     }
   }
 
-  return @($sidList)
+  return @($set)
 }
 
-function Get-AttributeAces {
+function Get-RelevantAcesForAttribute {
   param(
     [Parameter(Mandatory = $true)][System.DirectoryServices.ActiveDirectorySecurity]$Acl,
     [Parameter(Mandatory = $true)][Guid]$AttrGuid,
-    [Parameter(Mandatory = $true)][System.DirectoryServices.ActiveDirectoryRights[]]$RightsFilter,
-    [Parameter(Mandatory = $true)][bool]$IncludeInherited
+    [Parameter(Mandatory = $true)][bool]$IncludeInherited,
+    [Parameter(Mandatory = $true)][bool]$IncludeDeny
   )
 
   $rules = $Acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]) |
-    Where-Object {
-      $_ -is [System.DirectoryServices.ActiveDirectoryAccessRule] -and
-      $_.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow -and
-      $_.ObjectType -eq $AttrGuid -and
-      ($RightsFilter | Where-Object { $_ -band $_.ActiveDirectoryRights } | Measure-Object).Count -ge 0
-    }
-
-  # Filter rights explicitly - can include flags. Use bit test.
-  $rules = $rules | Where-Object {
-    $match = $false
-    foreach ($r in $RightsFilter) {
-      if (($_.ActiveDirectoryRights -band $r) -eq $r) { $match = $true; break }
-    }
-    $match
-  }
+    Where-Object { $_ -is [System.DirectoryServices.ActiveDirectoryAccessRule] }
 
   if (-not $IncludeInherited) {
     $rules = $rules | Where-Object { -not $_.IsInherited }
   }
 
+  if (-not $IncludeDeny) {
+    $rules = $rules | Where-Object { $_.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow }
+  }
+
+  # Relevant to attribute:
+  # - ObjectType = attribute GUID (property-specific)
+  # - ObjectType = empty GUID (applies to all properties for ReadProperty/WriteProperty)
+  $empty = [Guid]::Empty
+  $rules = $rules | Where-Object { $_.ObjectType -eq $AttrGuid -or $_.ObjectType -eq $empty }
+
   return @($rules)
+}
+
+function Classify-AceForAccess {
+  param(
+    [Parameter(Mandatory = $true)][System.DirectoryServices.ActiveDirectoryAccessRule]$Ace,
+    [Parameter(Mandatory = $true)][Guid]$AttrGuid,
+    [Parameter(Mandatory = $true)][bool]$WantRead,
+    [Parameter(Mandatory = $true)][bool]$WantWrite,
+    [Parameter(Mandatory = $true)][bool]$IncludeGrantCapable
+  )
+
+  $rights = $Ace.ActiveDirectoryRights
+
+  $readProperty  = [System.DirectoryServices.ActiveDirectoryRights]::ReadProperty
+  $writeProperty = [System.DirectoryServices.ActiveDirectoryRights]::WriteProperty
+  $genericRead   = [System.DirectoryServices.ActiveDirectoryRights]::GenericRead
+  $genericWrite  = [System.DirectoryServices.ActiveDirectoryRights]::GenericWrite
+  $genericAll    = [System.DirectoryServices.ActiveDirectoryRights]::GenericAll
+  $writeDacl     = [System.DirectoryServices.ActiveDirectoryRights]::WriteDacl
+  $writeOwner    = [System.DirectoryServices.ActiveDirectoryRights]::WriteOwner
+
+  $targetsAllProps = ($Ace.ObjectType -eq [Guid]::Empty)
+  $targetsAttr     = ($Ace.ObjectType -eq $AttrGuid)
+
+  $providesRead = $false
+  $providesWrite = $false
+  $canGrant = $false
+
+  # Read logic:
+  # - attribute-specific or all-properties ReadProperty
+  # - GenericRead / GenericAll
+  if ($WantRead) {
+    if ((($rights -band $genericAll) -eq $genericAll) -or (($rights -band $genericRead) -eq $genericRead)) {
+      $providesRead = $true
+    } elseif ((($rights -band $readProperty) -eq $readProperty) -and ($targetsAttr -or $targetsAllProps)) {
+      $providesRead = $true
+    }
+  }
+
+  # Write logic:
+  # - attribute-specific or all-properties WriteProperty
+  # - GenericWrite / GenericAll
+  if ($WantWrite) {
+    if ((($rights -band $genericAll) -eq $genericAll) -or (($rights -band $genericWrite) -eq $genericWrite)) {
+      $providesWrite = $true
+    } elseif ((($rights -band $writeProperty) -eq $writeProperty) -and ($targetsAttr -or $targetsAllProps)) {
+      $providesWrite = $true
+    }
+  }
+
+  if ($IncludeGrantCapable) {
+    if ((($rights -band $writeDacl) -eq $writeDacl) -or (($rights -band $writeOwner) -eq $writeOwner)) {
+      $canGrant = $true
+    }
+  }
+
+  return [PSCustomObject]@{
+    ProvidesRead  = $providesRead
+    ProvidesWrite = $providesWrite
+    CanGrant      = $canGrant
+  }
 }
 
 # Main
@@ -366,48 +452,38 @@ if ($PreferUser) { $resolveOrder = 'UserFirst' }
 $domainDn = Get-DomainDnFromDns -DnsName $Domain
 $ouDn = Normalize-OuDn -OuInput $OU -DomainDn $domainDn
 
-# Validate OU exists
 try {
   $null = Get-ADOrganizationalUnit -Server $Domain -Identity $ouDn -ErrorAction Stop
 } catch {
   throw "OU not found or not accessible: $ouDn. Error: $($_.Exception.Message)"
 }
 
-# Parse attributes
 $attrList = @(
   $Attribute.Split(',') |
     ForEach-Object { $_.Trim() } |
     Where-Object { $_ -ne '' } |
     Select-Object -Unique
 )
-
-if ($attrList.Count -eq 0) {
-  Throw-ArgError "Attribute list is empty."
-}
+if ($attrList.Count -eq 0) { Throw-ArgError "Attribute list is empty." }
 
 $guidMap = Get-SchemaAttributeGuidMap -Server $Domain
 
 $missing = @()
 $resolved = @()
 foreach ($a in $attrList) {
-  if ($guidMap.ContainsKey($a)) {
-    $resolved += [PSCustomObject]@{ Name = $a; Guid = $guidMap[$a] }
-  } else {
-    $missing += $a
-  }
+  if ($guidMap.ContainsKey($a)) { $resolved += [PSCustomObject]@{ Name = $a; Guid = $guidMap[$a] } }
+  else { $missing += $a }
 }
-
 if ($missing.Count -gt 0) {
   throw "One or more attributes were not found in schema by lDAPDisplayName: $($missing -join ', ')"
 }
 
 $acl = Get-ObjectAcl -DistinguishedName $ouDn
+$knownSidLabels = Get-KnownSidLabelMap -Server $Domain
 
-$readRight  = [System.DirectoryServices.ActiveDirectoryRights]::ReadProperty
-$writeRight = [System.DirectoryServices.ActiveDirectoryRights]::WriteProperty
-
-$rightsToCheck = @($readRight)
-if ($ReadWrite) { $rightsToCheck = @($readRight, $writeRight) }
+$wantRead = $true
+$wantWrite = $false
+if ($ReadWrite) { $wantWrite = $true }
 
 $principalObj = $null
 $principalTokenSids = @()
@@ -416,23 +492,36 @@ if ($Principal -and $Principal.Trim() -ne '') {
   $principalTokenSids = Get-PrincipalTokenSids -PrincipalObj $principalObj -Server $Domain
 }
 
-# Build report rows
 $rows = @()
 
 foreach ($attr in $resolved) {
-  $aces = Get-AttributeAces -Acl $acl -AttrGuid $attr.Guid -RightsFilter $rightsToCheck -IncludeInherited:$IncludeInherited
+  $aces = Get-RelevantAcesForAttribute -Acl $acl -AttrGuid $attr.Guid -IncludeInherited:$IncludeInherited -IncludeDeny:$IncludeDeny
 
   foreach ($ace in $aces) {
     $sid = [System.Security.Principal.SecurityIdentifier]$ace.IdentityReference
+    $friendly = Resolve-SidFriendly -Sid $sid -KnownSidLabels $knownSidLabels
+    $class = Classify-AceForAccess -Ace $ace -AttrGuid $attr.Guid -WantRead:$wantRead -WantWrite:$wantWrite -IncludeGrantCapable:$IncludeGrantCapable
+
+    $grantTypes = @()
+    if ($class.ProvidesRead) { $grantTypes += 'Read' }
+    if ($class.ProvidesWrite) { $grantTypes += 'Write' }
+    if ($class.CanGrant) { $grantTypes += 'CanGrant' }
+    if ($grantTypes.Count -eq 0) { continue }
+
+    $targets = if ($ace.ObjectType -eq [Guid]::Empty) { 'AllProperties' } else { 'AttributeOnly' }
+
     $rows += [PSCustomObject]@{
-      OU            = $ouDn
-      AttributeName = $attr.Name
-      AttributeGuid = $attr.Guid
-      Rights        = $ace.ActiveDirectoryRights.ToString()
-      IdentitySid   = $sid.Value
-      IdentityName  = Try-ResolveSidToName -Sid $sid -Server $Domain
-      IsInherited   = [bool]$ace.IsInherited
-      Inheritance   = $ace.InheritanceType.ToString()
+      OU              = $ouDn
+      AttributeName   = $attr.Name
+      AttributeGuid   = $attr.Guid
+      AppliesTo       = $targets
+      GrantTypes      = ($grantTypes -join ',')
+      AccessType      = $ace.AccessControlType.ToString()
+      Rights          = $ace.ActiveDirectoryRights.ToString()
+      IdentityName    = $friendly
+      IdentitySid     = $sid.Value
+      IsInherited     = [bool]$ace.IsInherited
+      InheritanceType = $ace.InheritanceType.ToString()
     }
   }
 }
@@ -445,19 +534,21 @@ if ($Raw) {
 Write-Host "Domain: $Domain"
 Write-Host "OU DN:  $ouDn"
 Write-Host "Attrs:  $($resolved.Name -join ', ')"
-Write-Host "Mode:   $(if ($ReadWrite) { 'read-write (report read + write)' } else { 'read-only (report read)' })"
+Write-Host "Mode:   $(if ($ReadWrite) { 'read-write (read + write + grant-capable)' } else { 'read-only (read + grant-capable)' })"
 Write-Host "Incl inherited: $IncludeInherited"
+Write-Host "Incl deny:      $IncludeDeny"
+Write-Host "Incl can-grant: $IncludeGrantCapable"
 Write-Host ""
 
-if (-not $PrincipalObj) {
+if (-not $principalObj) {
   if ($rows.Count -eq 0) {
-    Write-Host "No matching attribute ACEs found on this OU for the requested attributes."
+    Write-Host "No relevant ACEs found for the requested attributes on this OU (under the selected filters)."
     return
   }
 
   $rows |
-    Sort-Object AttributeName, Rights, IdentityName, IsInherited |
-    Format-Table -AutoSize AttributeName, Rights, IdentityName, IdentitySid, IsInherited, Inheritance |
+    Sort-Object AttributeName, GrantTypes, IdentityName, IsInherited |
+    Format-Table -AutoSize AttributeName, GrantTypes, AppliesTo, AccessType, IdentityName, IdentitySid, IsInherited, Rights |
     Out-String |
     ForEach-Object { Write-Host $_.TrimEnd() }
 
@@ -471,81 +562,80 @@ Write-Host "Resolved DN:     $($principalObj.DN)"
 Write-Host "Resolved SID:    $($principalObj.SID.Value)"
 Write-Host ""
 
-# Summarize effective access by attribute
+# Principal evaluation summary per attribute
 $summary = @()
-$grantDetails = @()
 
 foreach ($attr in $resolved) {
-  $aces = Get-AttributeAces -Acl $acl -AttrGuid $attr.Guid -RightsFilter $rightsToCheck -IncludeInherited:$IncludeInherited
+  $attrRows = $rows | Where-Object { $_.AttributeName -eq $attr.Name }
 
   $readGranted = $false
   $writeGranted = $false
+  $grantCapable = $false
 
-  $readGranting = New-Object System.Collections.Generic.List[string]
-  $writeGranting = New-Object System.Collections.Generic.List[string]
+  $readVia = @()
+  $writeVia = @()
+  $grantVia = @()
 
-  foreach ($ace in $aces) {
-    $aceSid = ([System.Security.Principal.SecurityIdentifier]$ace.IdentityReference).Value
-    $grantsPrincipal = $principalTokenSids -contains $aceSid
+  foreach ($r in $attrRows) {
+    $grantsPrincipal = $principalTokenSids -contains $r.IdentitySid
     if (-not $grantsPrincipal) { continue }
 
-    $friendly = Try-ResolveSidToName -Sid ([System.Security.Principal.SecurityIdentifier]$ace.IdentityReference) -Server $Domain
+    $gts = $r.GrantTypes.Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' }
 
-    if ((($ace.ActiveDirectoryRights -band $readRight) -eq $readRight)) {
-      $readGranted = $true
-      $readGranting.Add($friendly) | Out-Null
-    }
-    if ($ReadWrite -and ((($ace.ActiveDirectoryRights -band $writeRight) -eq $writeRight))) {
-      $writeGranted = $true
-      $writeGranting.Add($friendly) | Out-Null
-    }
+    if ($gts -contains 'Read') { $readGranted = $true; $readVia += $r.IdentityName }
+    if ($gts -contains 'Write') { $writeGranted = $true; $writeVia += $r.IdentityName }
+    if ($gts -contains 'CanGrant') { $grantCapable = $true; $grantVia += $r.IdentityName }
   }
 
-  # Also list who grants access in general (not just to the principal), for discovery in principal mode.
-  $allRead = @()
-  $allWrite = @()
-  foreach ($ace in $aces) {
-    $friendly = Try-ResolveSidToName -Sid ([System.Security.Principal.SecurityIdentifier]$ace.IdentityReference) -Server $Domain
-    if ((($ace.ActiveDirectoryRights -band $readRight) -eq $readRight)) {
-      $allRead += $friendly
-    }
-    if ($ReadWrite -and ((($ace.ActiveDirectoryRights -band $writeRight) -eq $writeRight))) {
-      $allWrite += $friendly
-    }
+  $othersRead = @()
+  $othersWrite = @()
+  $othersGrant = @()
+  foreach ($r in $attrRows) {
+    $gts = $r.GrantTypes.Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' }
+    if ($gts -contains 'Read') { $othersRead += $r.IdentityName }
+    if ($gts -contains 'Write') { $othersWrite += $r.IdentityName }
+    if ($gts -contains 'CanGrant') { $othersGrant += $r.IdentityName }
   }
 
   $summary += [PSCustomObject]@{
-    AttributeName   = $attr.Name
-    ReadGranted     = $readGranted
-    WriteGranted    = $(if ($ReadWrite) { $writeGranted } else { $null })
-    ReadVia         = $(if ($readGranting.Count -gt 0) { ($readGranting | Select-Object -Unique | Sort-Object) -join '; ' } else { '' })
-    WriteVia        = $(if ($ReadWrite -and $writeGranting.Count -gt 0) { ($writeGranting | Select-Object -Unique | Sort-Object) -join '; ' } else { '' })
-    OthersReadVia   = $(if ($allRead.Count -gt 0) { ($allRead | Select-Object -Unique | Sort-Object) -join '; ' } else { '' })
-    OthersWriteVia  = $(if ($ReadWrite -and $allWrite.Count -gt 0) { ($allWrite | Select-Object -Unique | Sort-Object) -join '; ' } else { '' })
+    AttributeName    = $attr.Name
+    ReadGranted      = $readGranted
+    WriteGranted     = $(if ($ReadWrite) { $writeGranted } else { $null })
+    CanGrantAcl      = $(if ($IncludeGrantCapable) { $grantCapable } else { $null })
+    ReadVia          = ($(($readVia | Select-Object -Unique | Sort-Object) -join '; '))
+    WriteVia         = ($(($writeVia | Select-Object -Unique | Sort-Object) -join '; '))
+    CanGrantVia      = ($(($grantVia | Select-Object -Unique | Sort-Object) -join '; '))
+    OthersReadVia    = ($(($othersRead | Select-Object -Unique | Sort-Object) -join '; '))
+    OthersWriteVia   = ($(($othersWrite | Select-Object -Unique | Sort-Object) -join '; '))
+    OthersCanGrant   = ($(($othersGrant | Select-Object -Unique | Sort-Object) -join '; '))
   }
 }
 
-$displayCols = @('AttributeName','ReadGranted','ReadVia','OthersReadVia')
-if ($ReadWrite) { $displayCols = @('AttributeName','ReadGranted','WriteGranted','ReadVia','WriteVia','OthersReadVia','OthersWriteVia') }
+$cols = @('AttributeName','ReadGranted','ReadVia','OthersReadVia')
+if ($ReadWrite) {
+  $cols = @('AttributeName','ReadGranted','WriteGranted','CanGrantAcl','ReadVia','WriteVia','CanGrantVia','OthersReadVia','OthersWriteVia','OthersCanGrant')
+} elseif ($IncludeGrantCapable) {
+  $cols = @('AttributeName','ReadGranted','CanGrantAcl','ReadVia','CanGrantVia','OthersReadVia','OthersCanGrant')
+}
 
 $summary |
   Sort-Object AttributeName |
-  Select-Object $displayCols |
+  Select-Object $cols |
   Format-Table -AutoSize |
   Out-String |
   ForEach-Object { Write-Host $_.TrimEnd() }
 
 Write-Host ""
-Write-Host "Detailed matching ACEs on OU (for requested attributes):"
-Write-Host "------------------------------------------------------"
+Write-Host "Detailed relevant ACEs on OU (filtered to requested attributes):"
+Write-Host "--------------------------------------------------------------"
 
 if ($rows.Count -eq 0) {
-  Write-Host "No matching attribute ACEs found on this OU for the requested attributes."
+  Write-Host "No relevant ACEs found for the requested attributes on this OU (under the selected filters)."
   return
 }
 
 $rows |
-  Sort-Object AttributeName, Rights, IdentityName, IsInherited |
-  Format-Table -AutoSize AttributeName, Rights, IdentityName, IdentitySid, IsInherited, Inheritance |
+  Sort-Object AttributeName, GrantTypes, IdentityName, IsInherited |
+  Format-Table -AutoSize AttributeName, GrantTypes, AppliesTo, AccessType, IdentityName, IdentitySid, IsInherited, Rights |
   Out-String |
   ForEach-Object { Write-Host $_.TrimEnd() }
