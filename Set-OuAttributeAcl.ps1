@@ -36,9 +36,6 @@ DNS name of the AD domain. Example: corp.example.com
 
 .PARAMETER OU
 OU distinguished-name fragment under the domain, or a full DN.
-Examples:
-  - "OU=Service Accounts,OU=Identity"
-  - "OU=Service Accounts,OU=Identity,DC=corp,DC=example,DC=com"
 
 .PARAMETER Attribute
 Comma-separated list of attribute LDAP display names.
@@ -69,12 +66,11 @@ Show intended changes but do not modify ACLs.
 
 .EXAMPLE
 .\Set-OuAttributeAcl.ps1 `
-  -Principal "svc_rfc2307_writer" `
-  -Domain "corp.example.com" `
-  -OU "OU=Linux,OU=Service Accounts,DC=corp,DC=example,DC=com" `
-  -Attribute "uid,uidNumber,gidNumber" `
-  -ReadOnly `
-  -PreferUser `
+  -Principal "ATTR_RW_UCSF02NUMBER" `
+  -Domain "gladstone.internal" `
+  -OU "OU=UCSF Identity Sync Test,OU=Process and Testing,OU=Accounts,OU=Gladstone" `
+  -Attribute "gladstone-UCSFID" `
+  -ReadWrite `
   -DryRun
 #>
 
@@ -132,7 +128,7 @@ function Ensure-ActiveDirectoryModule {
 function Get-DomainDnFromDns {
   param([Parameter(Mandatory = $true)][string]$DnsName)
 
-  $parts = $DnsName.Split('.') | Where-Object { $_ -and $_.Trim() -ne '' }
+  $parts = @($DnsName.Split('.') | Where-Object { $_ -and $_.Trim() -ne '' })
   if ($parts.Count -lt 2) {
     Throw-ArgError "Domain must be a DNS name like corp.example.com. Got: $DnsName"
   }
@@ -167,51 +163,51 @@ function Resolve-Principal {
 
   $idToTry = @($Identity)
 
-  if ($Identity -match '^[^\\]+\\[^\\]+$') {
+  if ($Identity -match '^[^\\]+\$begin:math:display$\^\\$end:math:display$+$') {
     $idToTry += $Identity.Split('\', 2)[1]
   }
 
-  $idToTry = $idToTry | Where-Object { $_ -and $_.Trim() -ne '' } | Select-Object -Unique
+  $idToTry = @($idToTry | Where-Object { $_ -and $_.Trim() -ne '' } | Select-Object -Unique)
 
   foreach ($id in $idToTry) {
     if ($Order -eq 'GroupFirst') {
       try {
         $g = Get-ADGroup -Server $Server -Identity $id -Properties objectSid, distinguishedName, samAccountName -ErrorAction Stop
         return [PSCustomObject]@{
-          Type  = 'Group'
-          Name  = $g.SamAccountName
-          DN    = $g.DistinguishedName
-          SID   = $g.SID
+          Type = 'Group'
+          Name = $g.SamAccountName
+          DN   = $g.DistinguishedName
+          SID  = $g.SID
         }
       } catch { }
 
       try {
         $u = Get-ADUser -Server $Server -Identity $id -Properties objectSid, distinguishedName, samAccountName -ErrorAction Stop
         return [PSCustomObject]@{
-          Type  = 'User'
-          Name  = $u.SamAccountName
-          DN    = $u.DistinguishedName
-          SID   = $u.SID
+          Type = 'User'
+          Name = $u.SamAccountName
+          DN   = $u.DistinguishedName
+          SID  = $u.SID
         }
       } catch { }
     } else {
       try {
         $u = Get-ADUser -Server $Server -Identity $id -Properties objectSid, distinguishedName, samAccountName -ErrorAction Stop
         return [PSCustomObject]@{
-          Type  = 'User'
-          Name  = $u.SamAccountName
-          DN    = $u.DistinguishedName
-          SID   = $u.SID
+          Type = 'User'
+          Name = $u.SamAccountName
+          DN   = $u.DistinguishedName
+          SID  = $u.SID
         }
       } catch { }
 
       try {
         $g = Get-ADGroup -Server $Server -Identity $id -Properties objectSid, distinguishedName, samAccountName -ErrorAction Stop
         return [PSCustomObject]@{
-          Type  = 'Group'
-          Name  = $g.SamAccountName
-          DN    = $g.DistinguishedName
-          SID   = $g.SID
+          Type = 'Group'
+          Name = $g.SamAccountName
+          DN   = $g.DistinguishedName
+          SID  = $g.SID
         }
       } catch { }
     }
@@ -260,7 +256,7 @@ function Set-ObjectAcl {
 
   $path = "AD:$DistinguishedName"
   if ($DryRun) {
-    Write-Info "DryRun: would set $Acl on $path"
+    Write-Info "DryRun: would set ACL on $path"
     return
   }
 
@@ -268,7 +264,7 @@ function Set-ObjectAcl {
     try {
       Set-Acl -Path $path -AclObject $Acl -ErrorAction Stop
     } catch {
-      throw "Failed to set $Acl on $path. Error: $($_.Exception.Message)"
+      throw "Failed to set ACL on $path. Error: $($_.Exception.Message)"
     }
   }
 }
@@ -305,16 +301,22 @@ $ouDn = Normalize-OuDn -OuInput $OU -DomainDn $domainDn
 
 # Validate OU exists
 try {
-  $ouObj = Get-ADOrganizationalUnit -Server $Domain -Identity $ouDn -ErrorAction Stop
+  $null = Get-ADOrganizationalUnit -Server $Domain -Identity $ouDn -ErrorAction Stop
 } catch {
   throw "OU not found or not accessible: $ouDn. Error: $($_.Exception.Message)"
 }
 
 $principalObj = Resolve-Principal -Identity $Principal -Server $Domain -Order $resolveOrder
 
-# Parse attributes
-$attrList = $Attribute.Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' } | Select-Object -Unique
-if (-not $attrList -or $attrList.Count -eq 0) {
+# Parse attributes (force array output even for a single attribute)
+$attrList = @(
+  $Attribute.Split(',') |
+    ForEach-Object { $_.Trim() } |
+    Where-Object { $_ -ne '' } |
+    Select-Object -Unique
+)
+
+if ($attrList.Count -eq 0) {
   Throw-ArgError "Attribute list is empty."
 }
 
@@ -334,9 +336,11 @@ Write-Info ""
 $guidMap = Get-SchemaAttributeGuidMap -Server $Domain
 
 $missing = @()
-$resolved = foreach ($a in $attrList) {
+$resolved = @()
+
+foreach ($a in $attrList) {
   if ($guidMap.ContainsKey($a)) {
-    [PSCustomObject]@{ Name = $a; Guid = $guidMap[$a] }
+    $resolved += [PSCustomObject]@{ Name = $a; Guid = $guidMap[$a] }
   } else {
     $missing += $a
   }
