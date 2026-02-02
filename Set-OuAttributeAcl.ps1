@@ -260,7 +260,7 @@ function Set-ObjectAcl {
 
   $path = "AD:$DistinguishedName"
   if ($DryRun) {
-    Write-Info "DryRun: would set ACL on $path"
+    Write-Info "DryRun: would set $Acl on $path"
     return
   }
 
@@ -268,7 +268,7 @@ function Set-ObjectAcl {
     try {
       Set-Acl -Path $path -AclObject $Acl -ErrorAction Stop
     } catch {
-      throw "Failed to set ACL on $path. Error: $($_.Exception.Message)"
+      throw "Failed to set $Acl on $path. Error: $($_.Exception.Message)"
     }
   }
 }
