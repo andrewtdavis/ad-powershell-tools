@@ -1,94 +1,58 @@
 <#
 .SYNOPSIS
-Reports attribute-level ACLs on an OU, including well-known identities, common domain admin groups (known RIDs),
-and broader rights that imply read/write access or the ability to grant access.
+Reports attribute-level ACLs on an OU, including well-known identities, common RID-based domain groups,
+and broader rights that imply attribute read/write access. Unknown domain SIDs are annotated with the base domain SID.
 
 .DESCRIPTION
-Reads the security descriptor (DACL) on a target OU and reports allow ACEs that can result in effective
-ReadProperty and/or WriteProperty access for specific attributes.
+Reads the DACL on a target OU and reports allow ACEs that can result in effective ReadProperty and/or WriteProperty
+access for specific attributes.
 
-This script supports two modes:
+Enhancements in this revision:
+  - Adds BUILTIN\Pre-Windows 2000 Compatible Access (S-1-5-32-554)
+  - When a SID does not resolve, annotates domain SIDs (S-1-5-21-...-RID) with the base domain SID:
+      Example: "S-1-5-21-A-B-C-1234 [domainSid=S-1-5-21-A-B-C rid=1234]"
+    This is helpful when ACLs contain orphaned SIDs from removed trusts or decommissioned domains.
 
-1) Discovery mode (no -Principal)
-   - Lists identities on the OU ACL (including inherited if enabled) that grant access for each requested attribute.
-   - Includes:
-     - attribute-specific ACEs (ObjectType = attribute GUID)
-     - "all properties" ACEs (ObjectType = empty GUID) with ReadProperty/WriteProperty
-     - broader rights that imply access (GenericAll, GenericWrite, GenericRead)
-     - rights that allow granting access (WriteDacl, WriteOwner)
-
-2) Principal evaluation mode (-Principal provided)
-   - Evaluates whether the principal can read/write the attribute through:
-     - direct ACEs
-     - group membership (nested groups)
-     - inherited ACEs (if enabled)
-   - Also shows which identities provide that access, plus which identities on the ACL provide access in general.
-
-Identity name resolution:
-  - Well-known SIDs are mapped (Everyone, Authenticated Users, etc).
-  - Known RID groups are labeled (Domain Admins - 512, etc) based on domain SID (and forest root SID for Enterprise Admins).
-  - Otherwise uses SID.Translate(NTAccount) and falls back to SID string.
-
-Important limitations:
-  - Deny ACEs are reported (optionally) but are not used to compute a full Windows "effective access" result.
-  - Central Access Policies, claims-based auth, and permissions derived from other objects are not evaluated.
-  - "Can grant access" (WriteDacl/WriteOwner) indicates potential ability, not immediate attribute access without an ACL change.
+See previous header content for full behavior.
 
 .PARAMETER Principal
-Optional. Identity of the user or group to evaluate (user or group). If omitted, discovery mode is used.
+Optional. Identity of the user or group to evaluate.
 
 .PARAMETER Domain
-DNS name of the AD domain. Example: corp.example.com
+DNS name of the AD domain.
 
 .PARAMETER OU
-OU distinguished-name fragment under the domain, or a full DN.
-Examples:
-  - "OU=Service Accounts,OU=Identity"
-  - "OU=Service Accounts,OU=Identity,DC=corp,DC=example,DC=com"
+OU DN fragment or full DN.
 
 .PARAMETER Attribute
 Comma-separated list of attribute LDAP display names.
-Example: "uid,uidNumber,gidNumber,unixHomeDirectory,loginShell"
 
 .PARAMETER ReadOnly
-Report and evaluate ReadProperty only (but still shows grant-capable rights if enabled).
+Report and evaluate ReadProperty only.
 
 .PARAMETER ReadWrite
-Report and evaluate both ReadProperty and WriteProperty (and grant-capable rights if enabled).
+Report and evaluate ReadProperty and WriteProperty.
 
 .PARAMETER PreferGroup
-Prefer resolving Principal as a group first (default when ambiguous).
+Prefer resolving Principal as a group first.
 
 .PARAMETER PreferUser
 Prefer resolving Principal as a user first.
 
 .PARAMETER IncludeInherited
-Include inherited ACEs in reporting and evaluation. Default: enabled.
+Include inherited ACEs.
 
 .PARAMETER IncludeDeny
-Include Deny ACEs in reporting output. Default: disabled.
+Include deny ACEs in output (deny not used for full effective access computation).
 
 .PARAMETER IncludeGrantCapable
-Include rights that allow granting access (WriteDacl/WriteOwner). Default: enabled.
+Include WriteDacl/WriteOwner as "CanGrant".
 
 .PARAMETER Raw
-Output raw rows (objects) instead of formatted tables.
+Output objects rather than formatted tables.
 
 .EXAMPLE
-# Discovery mode: who has read/write access (direct or implied) for these attributes on the OU
 .\Get-OuAttributeAcl.ps1 -Domain test.com -OU "OU=Accounts,OU=Gladstone" -Attribute "uid,uidNumber,gidNumber" -ReadWrite
-
-.EXAMPLE
-# Principal mode: does this group have access, and via which ACE identities
-.\Get-OuAttributeAcl.ps1 -Principal "ATTR_RW_UNIX_RFC2307" -Domain test.com -OU "OU=Linux,OU=Service Accounts" -Attribute "uidNumber" -ReadWrite
-
-.EXAMPLE
-# Include deny entries in the output
-.\Get-OuAttributeAcl.ps1 -Domain test.com -OU "OU=Accounts,OU=Gladstone" -Attribute "uidNumber" -ReadWrite -IncludeDeny
-
-.EXAMPLE
-# Raw output
-.\Get-OuAttributeAcl.ps1 -Domain test.com -OU "OU=Accounts,OU=Gladstone" -Attribute "uidNumber" -ReadWrite -Raw
 #>
 
 [CmdletBinding(DefaultParameterSetName = 'ReadOnly')]
@@ -241,11 +205,8 @@ function Get-ObjectAcl {
 }
 
 function Get-KnownSidLabelMap {
-  param(
-    [Parameter(Mandatory = $true)][string]$Server
-  )
+  param([Parameter(Mandatory = $true)][string]$Server)
 
-  # Well-known SIDs (not domain-specific)
   $map = @{
     'S-1-1-0'      = 'Everyone'
     'S-1-5-11'     = 'Authenticated Users'
@@ -254,13 +215,13 @@ function Get-KnownSidLabelMap {
     'S-1-5-32-544' = 'BUILTIN\Administrators'
     'S-1-5-32-545' = 'BUILTIN\Users'
     'S-1-5-32-546' = 'BUILTIN\Guests'
-    'S-1-5-32-551' = 'BUILTIN\Backup Operators'
     'S-1-5-32-548' = 'BUILTIN\Account Operators'
     'S-1-5-32-549' = 'BUILTIN\Server Operators'
     'S-1-5-32-550' = 'BUILTIN\Print Operators'
+    'S-1-5-32-551' = 'BUILTIN\Backup Operators'
+    'S-1-5-32-554' = 'BUILTIN\Pre-Windows 2000 Compatible Access'
   }
 
-  # Domain and forest root well-known RIDs (domain-specific groups)
   $domainSid = $null
   $forestRootSid = $null
 
@@ -284,10 +245,7 @@ function Get-KnownSidLabelMap {
     $map["$domainSid-515"] = 'Domain Computers (RID 515)'
     $map["$domainSid-516"] = 'Domain Controllers (RID 516)'
     $map["$domainSid-517"] = 'Cert Publishers (RID 517)'
-    $map["$domainSid-518"] = 'Schema Admins (RID 518) [domain]'
-    $map["$domainSid-519"] = 'Enterprise Admins (RID 519) [domain]'
     $map["$domainSid-520"] = 'Group Policy Creator Owners (RID 520)'
-    $map["$domainSid-544"] = 'Administrators (RID 544) [domain local]'
   }
 
   if ($forestRootSid) {
@@ -298,6 +256,20 @@ function Get-KnownSidLabelMap {
   return $map
 }
 
+function Get-DomainSidAnnotation {
+  param([Parameter(Mandatory = $true)][string]$SidString)
+
+  # Returns a short annotation string for S-1-5-21-...-RID SIDs, otherwise $null.
+  if ($SidString -notmatch '^S-1-5-21-(\d+)-(\d+)-(\d+)-(\d+)$') {
+    return $null
+  }
+
+  $parts = $SidString.Split('-')
+  $rid = $parts[-1]
+  $domainSid = ($parts[0..($parts.Length - 2)] -join '-')
+  return "domainSid=$domainSid rid=$rid"
+}
+
 function Resolve-SidFriendly {
   param(
     [Parameter(Mandatory = $true)][System.Security.Principal.SecurityIdentifier]$Sid,
@@ -305,11 +277,18 @@ function Resolve-SidFriendly {
   )
 
   $sidStr = $Sid.Value
-  if ($KnownSidLabels.ContainsKey($sidStr)) { return $KnownSidLabels[$sidStr] }
+
+  if ($KnownSidLabels.ContainsKey($sidStr)) {
+    return $KnownSidLabels[$sidStr]
+  }
 
   try {
     return ($Sid.Translate([System.Security.Principal.NTAccount])).Value
   } catch {
+    $ann = Get-DomainSidAnnotation -SidString $sidStr
+    if ($ann) {
+      return "$sidStr [$ann]"
+    }
     return $sidStr
   }
 }
@@ -329,7 +308,6 @@ function Get-PrincipalTokenSids {
       $null = $set.Add(([System.Security.Principal.SecurityIdentifier]$tg).Value)
     }
   } else {
-    # For groups, approximate "token-like" SIDs by including nested groups.
     $dns = @($PrincipalObj.DN)
     try {
       $nestedDns = Get-ADGroupMember -Server $Server -Identity $PrincipalObj.DN -Recursive -ErrorAction Stop |
@@ -361,17 +339,9 @@ function Get-RelevantAcesForAttribute {
   $rules = $Acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]) |
     Where-Object { $_ -is [System.DirectoryServices.ActiveDirectoryAccessRule] }
 
-  if (-not $IncludeInherited) {
-    $rules = $rules | Where-Object { -not $_.IsInherited }
-  }
+  if (-not $IncludeInherited) { $rules = $rules | Where-Object { -not $_.IsInherited } }
+  if (-not $IncludeDeny) { $rules = $rules | Where-Object { $_.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow } }
 
-  if (-not $IncludeDeny) {
-    $rules = $rules | Where-Object { $_.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow }
-  }
-
-  # Relevant to attribute:
-  # - ObjectType = attribute GUID (property-specific)
-  # - ObjectType = empty GUID (applies to all properties for ReadProperty/WriteProperty)
   $empty = [Guid]::Empty
   $rules = $rules | Where-Object { $_.ObjectType -eq $AttrGuid -or $_.ObjectType -eq $empty }
 
@@ -404,9 +374,6 @@ function Classify-AceForAccess {
   $providesWrite = $false
   $canGrant = $false
 
-  # Read logic:
-  # - attribute-specific or all-properties ReadProperty
-  # - GenericRead / GenericAll
   if ($WantRead) {
     if ((($rights -band $genericAll) -eq $genericAll) -or (($rights -band $genericRead) -eq $genericRead)) {
       $providesRead = $true
@@ -415,9 +382,6 @@ function Classify-AceForAccess {
     }
   }
 
-  # Write logic:
-  # - attribute-specific or all-properties WriteProperty
-  # - GenericWrite / GenericAll
   if ($WantWrite) {
     if ((($rights -band $genericAll) -eq $genericAll) -or (($rights -band $genericWrite) -eq $genericWrite)) {
       $providesWrite = $true
@@ -526,10 +490,7 @@ foreach ($attr in $resolved) {
   }
 }
 
-if ($Raw) {
-  $rows
-  return
-}
+if ($Raw) { $rows; return }
 
 Write-Host "Domain: $Domain"
 Write-Host "OU DN:  $ouDn"
@@ -562,7 +523,6 @@ Write-Host "Resolved DN:     $($principalObj.DN)"
 Write-Host "Resolved SID:    $($principalObj.SID.Value)"
 Write-Host ""
 
-# Principal evaluation summary per attribute
 $summary = @()
 
 foreach ($attr in $resolved) {
@@ -577,9 +537,7 @@ foreach ($attr in $resolved) {
   $grantVia = @()
 
   foreach ($r in $attrRows) {
-    $grantsPrincipal = $principalTokenSids -contains $r.IdentitySid
-    if (-not $grantsPrincipal) { continue }
-
+    if (-not ($principalTokenSids -contains $r.IdentitySid)) { continue }
     $gts = $r.GrantTypes.Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' }
 
     if ($gts -contains 'Read') { $readGranted = $true; $readVia += $r.IdentityName }
