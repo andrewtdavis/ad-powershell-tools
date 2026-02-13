@@ -99,17 +99,6 @@ function Show-Binary {
 }
 
 function Get-DefaultBoundDomain {
-    <#
-      Attempts to discover the computer's joined AD domain.
-
-      Order:
-      - USERDNSDOMAIN environment variable
-      - Win32_ComputerSystem.Domain (domain joined)
-      - System.DirectoryServices.ActiveDirectory.Domain::GetComputerDomain()
-
-      Returns:
-      - Domain DNS name (example.com) or $null
-    #>
     $d = $null
 
     try {
@@ -168,14 +157,6 @@ function Get-RootDseDefaultNamingContext {
 }
 
 function Resolve-LdapTargets {
-    <#
-      Produces LDAP connection targets for ADSI search.
-
-      Returns an object with:
-      - Server (optional)
-      - BaseDN (required)
-      - SearchRootPath (LDAP://... base)
-    #>
     param(
         [Parameter(Mandatory = $false)][string]$DomainOrServer,
         [System.Management.Automation.PSCredential]$Credential = $null
@@ -221,13 +202,30 @@ function Resolve-LdapTargets {
 }
 
 function Escape-LdapFilterValue {
-    param([Parameter(Mandatory = $true)][string]$Value)
+    <#
+      Escapes LDAP filter assertion values per RFC 4515.
+      Escapes: \ * ( ) and NUL as \5c \2a \28 \29 \00
 
-    try {
-        return [System.DirectoryServices.Protocols.LdapEncoder]::FilterEncode($Value)
-    } catch {
-        return $Value.Replace('\', '\5c').Replace('*', '\2a').Replace('(', '\28').Replace(')', '\29').Replace([char]0, '\00')
+      Returns:
+      - Escaped string safe for use inside (...) filter components.
+    #>
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Value)
+
+    if ($null -eq $Value) { return "" }
+
+    $sb = New-Object System.Text.StringBuilder
+    foreach ($ch in $Value.ToCharArray()) {
+        $code = [int][char]$ch
+        switch ($code) {
+            0      { [void]$sb.Append('\00') }
+            40     { [void]$sb.Append('\28') } # (
+            41     { [void]$sb.Append('\29') } # )
+            42     { [void]$sb.Append('\2a') } # *
+            92     { [void]$sb.Append('\5c') } # \
+            default { [void]$sb.Append($ch) }
+        }
     }
+    $sb.ToString()
 }
 
 function Normalize-FieldsCaseInsensitive {
@@ -240,7 +238,11 @@ function Normalize-FieldsCaseInsensitive {
 }
 
 # Parameter validation
-if ((-not $User -or -not $User.Trim()) -and (-not $LookupField -or -not $LookupField.Trim())) {
+$User = if ($User) { $User.Trim() } else { $null }
+$LookupField = if ($LookupField) { $LookupField.Trim() } else { $null }
+$LookupValue = if ($LookupValue) { $LookupValue.Trim() } else { $null }
+
+if ((-not $User) -and (-not $LookupField)) {
     throw "Specify either -User, or -LookupField and -LookupValue."
 }
 if ($LookupField -and (-not $LookupValue)) {
@@ -249,8 +251,11 @@ if ($LookupField -and (-not $LookupValue)) {
 if ($LookupValue -and (-not $LookupField)) {
     throw "-LookupField is required when -LookupValue is specified."
 }
+if ($LookupField -and $LookupValue -eq "") {
+    throw "-LookupValue must not be empty."
+}
 
-# Capture what will be printed as Domain label, while keeping actual ADSI targeting logic separate.
+# Domain label + target selection
 $domainLabel = $Domain
 $domainForTargets = $Domain
 
@@ -282,15 +287,15 @@ try {
 if ($usedADModule) {
     try {
         $serverParam = $null
-        if ($domainForTargets -and $domainForTargets.Trim()) {
-            $serverParam = $domainForTargets.Trim()
+        if ($domainForTargets) {
+            $serverParam = $domainForTargets
         }
 
         $adUser = $null
 
         if ($LookupField) {
             $escapedVal = Escape-LdapFilterValue -Value $LookupValue
-            $escapedField = $LookupField.Trim()
+            $escapedField = $LookupField
             $ldapFilter = "(&(objectCategory=person)(objectClass=user)($escapedField=$escapedVal))"
 
             $adParams = @{
@@ -366,7 +371,7 @@ if (-not $usedADModule) {
 
     if ($LookupField) {
         $escapedVal = Escape-LdapFilterValue -Value $LookupValue
-        $escapedField = $LookupField.Trim()
+        $escapedField = $LookupField
         $searcher.Filter = "(&(objectCategory=person)(objectClass=user)($escapedField=$escapedVal))"
     } else {
         $escaped = Escape-LdapFilterValue -Value $User
