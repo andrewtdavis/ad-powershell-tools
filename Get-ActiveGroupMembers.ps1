@@ -1,53 +1,69 @@
 ﻿<#
-.SYNOPSIS
-    Enumerates members of an Active Directory group across multiple domains/forests and outputs selected user fields.
+.INFO
+  Synopsis:
+    Enumerate AD group members across domains/forests and output selected user fields.
 
-.DESCRIPTION
-    Retrieves group members for the specified group (by name or distinguished name) and resolves each member to an AD user.
-    Cross-domain lookups are supported by probing the member's DN-derived DNS domain first, then falling back to a domain list.
+  Description:
+    Retrieves group members for the specified group (by name or distinguished name) and resolves
+    each member to an AD user. Cross-domain lookups are supported by probing the member's DN-derived
+    DNS domain first, then falling back to a domain list.
 
     Domain list behavior:
       - If -Domains is provided, it is used for group resolution and as fallback for user resolution.
-      - If -Domains is not provided, the script attempts to discover domains from the current forest (Get-ADForest).Domains.
-        If discovery fails (no connectivity/permissions), the current domain context is used.
+      - If -Domains is not provided, the script attempts to discover domains from the current forest
+        (Get-ADForest).Domains. If discovery fails, current domain context is used.
 
     Output formats:
       - Default: one username per line (SamAccountName), sorted unique
-      - -Name / -Email / -Attributes: structured output with selected properties
-      - -Csv: comma-separated values
-      - -Tsv: tab-separated values (with quoting for fields that contain tabs/newlines/quotes)
+      - Structured: PowerShell table output if fields beyond SamAccountName are requested
+      - -Csv: CSV output
+      - -Tsv: TSV output (with quoting for fields that contain tabs/newlines/quotes)
 
-.PARAMETER GroupName
-    Group name (sAMAccountName, CN, or distinguished name). Supports positional usage.
+    Field selection:
+      - If -Fields is provided, it defines the output columns and which AD attributes are requested.
+        Special aliases:
+          * Email -> AD attribute mail, output column name Email
+      - If -Fields is not provided, output is built from:
+          SamAccountName (always), optional -Name, optional -Email, plus -Attributes.
 
-.PARAMETER Domains
-    One or more domains or domain controllers to query (e.g., "ad.example.net", "dc01.ad.example.net").
-    If omitted, domains are discovered from the current forest when possible.
+  Parameters:
+    -GroupName
+      Group name (sAMAccountName, CN, or distinguished name). Supports positional usage.
 
-.PARAMETER Name
-    Include the AD 'Name' field in structured output.
+    -Domains
+      One or more domains or domain controllers to query.
 
-.PARAMETER Email
-    Include the AD 'mail' attribute in structured output (output column name 'Email').
+    -Fields
+      Optional. Explicit output columns / lookup fields.
+      Examples: SamAccountName,Name,Email,uidNumber,employeeID
 
-.PARAMETER Attributes
-    Additional AD user attributes to include in structured output.
-    Examples: EmployeeID, LastLogonDate, LockedOut, AccountExpirationDate, Enabled, WhenCreated, Department, Title.
+    -Name
+      Include the AD 'Name' field (legacy behavior).
 
-.PARAMETER Csv
-    Output structured results as CSV. Mutually exclusive with -Tsv.
+    -Email
+      Include the AD 'mail' attribute, output column name 'Email' (legacy behavior).
 
-.PARAMETER Tsv
-    Output structured results as TSV. Mutually exclusive with -Csv.
+    -Attributes
+      Additional AD attributes to include (legacy behavior).
 
-.EXAMPLE
+    -Csv
+      Output structured results as CSV. Mutually exclusive with -Tsv.
+
+    -Tsv
+      Output structured results as TSV. Mutually exclusive with -Csv.
+
+  Examples:
     # Default output: usernames only
     .\Get-ActiveGroupMembers.ps1 "CoreHPC_Base"
 
-.EXAMPLE
-    # Include Name and Email, output as TSV with extra attributes
-    .\Get-ActiveGroupMembers.ps1 "CoreHPC_Base" -Name -Email -Attributes EmployeeID,LastLogonDate -Tsv
+    # Legacy behavior
+    .\Get-ActiveGroupMembers.ps1 "CoreHPC_Base" -Name -Email -Attributes EmployeeID,LastLogonDate
 
+    # Explicit fields (drives lookup + output)
+    .\Get-ActiveGroupMembers.ps1 "CoreHPC_Base" -Fields SamAccountName,Name,Email,uidNumber -Tsv
+
+    # CSV with explicit fields
+    .\Get-ActiveGroupMembers.ps1 "CoreHPC_Base" -Fields SamAccountName,Email,Department -Csv
 #>
 
 [CmdletBinding()]
@@ -58,6 +74,9 @@ param(
 
     [Parameter(Mandatory = $false)]
     [string[]]$Domains = @(),
+
+    [Parameter(Mandatory = $false)]
+    [string[]]$Fields = @(),
 
     [Parameter(Mandatory = $false)]
     [switch]$Name,
@@ -172,7 +191,6 @@ function Get-ADUserCrossDomain {
         }
     }
 
-    # If no domains to try, rely on current context
     if ($tryList.Count -eq 0) {
         try { return Get-ADUser -Identity $DistinguishedName -Properties $Properties }
         catch { return $null }
@@ -202,7 +220,6 @@ function Resolve-ADGroupCrossDomain {
         [string[]]$DomainList
     )
 
-    # If no domain list, attempt in current context
     if (-not $DomainList -or $DomainList.Count -eq 0) {
         return Get-ADGroup -Identity $Identity -ErrorAction Stop
     }
@@ -231,7 +248,6 @@ function Get-ADGroupMembersCrossDomain {
         [string[]]$DomainList
     )
 
-    # Prefer DN-derived domain for the group itself
     $groupDomain = $null
     if ($Group.DistinguishedName) {
         $groupDomain = Get-DomainFromDistinguishedName -DistinguishedName $Group.DistinguishedName
@@ -243,7 +259,6 @@ function Get-ADGroupMembersCrossDomain {
         if (-not $tryList.Contains($d)) { [void]$tryList.Add($d) }
     }
 
-    # If no domains to try, current context
     if ($tryList.Count -eq 0) {
         return Get-ADGroupMember -Identity $Group.DistinguishedName -Recursive -ErrorAction Stop
     }
@@ -297,33 +312,92 @@ function ConvertTo-Tsv {
     return ($lines -join "`r`n")
 }
 
-# Determine whether structured output is needed
-$needsStructured = $false
-if ($Name -or $Email -or ($Attributes.Count -gt 0) -or $Csv -or $Tsv) { $needsStructured = $true }
-
-# Build output property list
-$baseOutProps = @('SamAccountName')
-if ($Name)  { $baseOutProps += 'Name' }
-if ($Email) { $baseOutProps += 'Email' }
-
-# Normalize additional attributes: unique, non-empty, exclude ones we already map
-$extraOutProps = @()
-if ($Attributes) {
-    $extraOutProps = $Attributes |
+function Normalize-UniqueNonEmpty {
+    param([string[]]$Values)
+    if (-not $Values) { return @() }
+    $Values |
         Where-Object { $_ -and $_.Trim().Length -gt 0 } |
         ForEach-Object { $_.Trim() } |
-        Select-Object -Unique |
-        Where-Object { $_ -notin @('SamAccountName','Name','Email','mail') }
+        Select-Object -Unique
 }
 
-$outProps = @($baseOutProps + $extraOutProps)
+function Build-FieldPlan {
+    <#
+    .SYNOPSIS
+        Builds output column plan and AD property request list.
+    .DESCRIPTION
+        Returns:
+          - OutColumns: ordered list of output column names
+          - AdProps: AD properties to request via Get-ADUser
+          - ColumnToAdProp: mapping output column -> AD property name
+    #>
+    param(
+        [string[]]$ExplicitFields,
+        [switch]$LegacyName,
+        [switch]$LegacyEmail,
+        [string[]]$LegacyAttributes
+    )
 
-# Determine AD properties to request
-$adProps = New-Object System.Collections.Generic.HashSet[string] ([System.StringComparer]::OrdinalIgnoreCase)
-[void]$adProps.Add('SamAccountName')
-if ($Name)  { [void]$adProps.Add('Name') }
-if ($Email) { [void]$adProps.Add('mail') }
-foreach ($p in $extraOutProps) { [void]$adProps.Add($p) }
+    $columnToAdProp = [ordered]@{}
+    $outColumns = New-Object System.Collections.Generic.List[string]
+    $adProps = New-Object System.Collections.Generic.HashSet[string]([System.StringComparer]::OrdinalIgnoreCase)
+
+    $addColumn = {
+        param([string]$ColumnName, [string]$AdPropName)
+        if (-not $columnToAdProp.Contains($ColumnName)) {
+            $columnToAdProp[$ColumnName] = $AdPropName
+            [void]$outColumns.Add($ColumnName)
+        }
+        if ($AdPropName -and $AdPropName.Trim()) {
+            [void]$adProps.Add($AdPropName)
+        }
+    }
+
+    $explicit = Normalize-UniqueNonEmpty -Values $ExplicitFields
+
+    if ($explicit.Count -gt 0) {
+        foreach ($f in $explicit) {
+            switch -Regex ($f) {
+                '^(?i)samaccountname$' { & $addColumn 'SamAccountName' 'SamAccountName' }
+                '^(?i)name$'           { & $addColumn 'Name' 'Name' }
+                '^(?i)email$'          { & $addColumn 'Email' 'mail' }
+                default                { & $addColumn $f $f }
+            }
+        }
+
+        if (-not $columnToAdProp.Contains('SamAccountName')) {
+            $existing = @($outColumns)
+            $outColumns.Clear()
+            & $addColumn 'SamAccountName' 'SamAccountName' | Out-Null
+            foreach ($c in $existing) { if ($c -ne 'SamAccountName') { [void]$outColumns.Add($c) } }
+        }
+
+        return [pscustomobject]@{
+            OutColumns     = [string[]]$outColumns
+            AdProps        = [string[]]$adProps
+            ColumnToAdProp = $columnToAdProp
+            UsesExplicit   = $true
+        }
+    }
+
+    & $addColumn 'SamAccountName' 'SamAccountName' | Out-Null
+    if ($LegacyName)  { & $addColumn 'Name' 'Name' | Out-Null }
+    if ($LegacyEmail) { & $addColumn 'Email' 'mail' | Out-Null }
+
+    $extras = Normalize-UniqueNonEmpty -Values $LegacyAttributes |
+        Where-Object { $_ -notin @('SamAccountName','Name','Email','mail') }
+
+    foreach ($p in $extras) {
+        & $addColumn $p $p | Out-Null
+    }
+
+    return [pscustomobject]@{
+        OutColumns     = [string[]]$outColumns
+        AdProps        = [string[]]$adProps
+        ColumnToAdProp = $columnToAdProp
+        UsesExplicit   = $false
+    }
+}
 
 # Build domain list
 $fallbackDomains = Get-FallbackDomainList -ExplicitDomains $Domains
@@ -345,7 +419,36 @@ if (-not $group) {
 
 $members = Get-ADGroupMembersCrossDomain -Group $group -DomainList $fallbackDomains
 
-# Filter to users + resolve each to an AD user for property retrieval
+# Build field plan (columns + AD properties)
+$fieldPlan = Build-FieldPlan -ExplicitFields $Fields -LegacyName:$Name -LegacyEmail:$Email -LegacyAttributes $Attributes
+$outProps = $fieldPlan.OutColumns
+$adProps = $fieldPlan.AdProps
+$colToProp = $fieldPlan.ColumnToAdProp
+
+# Determine whether structured output is needed
+$needsStructured = $false
+
+# Explicit fields means structured unless it is only SamAccountName and no forced formatting.
+if ($fieldPlan.UsesExplicit) {
+    if ($outProps.Count -gt 1) { $needsStructured = $true }
+} else {
+    if ($Name -or $Email -or ($Attributes.Count -gt 0)) { $needsStructured = $true }
+}
+
+if ($Csv -or $Tsv) { $needsStructured = $true }
+
+# If still not structured, output usernames only
+if (-not $needsStructured) {
+    $namesOnly = New-Object System.Collections.Generic.List[string]
+    foreach ($m in $members) {
+        if ($m.objectClass -ne 'user') { continue }
+        if ($m.SamAccountName) { [void]$namesOnly.Add([string]$m.SamAccountName) }
+    }
+    $namesOnly | Sort-Object -Unique
+    exit 0
+}
+
+# Resolve each member to an AD user for property retrieval and build output rows
 $results = New-Object System.Collections.Generic.List[object]
 
 foreach ($m in $members) {
@@ -353,27 +456,17 @@ foreach ($m in $members) {
 
     $u = $null
     if ($m.DistinguishedName) {
-        $u = Get-ADUserCrossDomain -DistinguishedName $m.DistinguishedName -Properties ([string[]]$adProps) -FallbackDomains $fallbackDomains
+        $u = Get-ADUserCrossDomain -DistinguishedName $m.DistinguishedName -Properties $adProps -FallbackDomains $fallbackDomains
     }
 
     if (-not $u) {
         continue
     }
 
-    if (-not $needsStructured) {
-        [void]$results.Add([pscustomobject]@{ SamAccountName = $u.SamAccountName })
-        continue
-    }
-
-    $row = [ordered]@{
-        SamAccountName = $u.SamAccountName
-    }
-
-    if ($Name)  { $row['Name']  = $u.Name }
-    if ($Email) { $row['Email'] = $u.mail }
-
-    foreach ($p in $extraOutProps) {
-        $row[$p] = $u.$p
+    $row = [ordered]@{}
+    foreach ($col in $outProps) {
+        $adProp = $colToProp[$col]
+        $row[$col] = $u.$adProp
     }
 
     [void]$results.Add([pscustomobject]$row)
@@ -381,11 +474,6 @@ foreach ($m in $members) {
 
 # Sort + unique by SamAccountName
 $sorted = $results | Sort-Object -Property SamAccountName -Unique
-
-if (-not $needsStructured -and -not $Csv -and -not $Tsv) {
-    $sorted | ForEach-Object { $_.SamAccountName }
-    exit 0
-}
 
 if ($Csv) {
     $sorted | Select-Object -Property $outProps | ConvertTo-Csv -NoTypeInformation
