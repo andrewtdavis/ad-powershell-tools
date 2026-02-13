@@ -11,10 +11,10 @@
     Domain selection behavior:
     - If -Domain is not specified, the script attempts to determine the computer's joined AD domain.
     - If the system is not domain-joined and -Domain is not specified, the script fails with an error.
-    - If -Domain is a DC hostname, the script queries RootDSE to discover the defaultNamingContext.
+    - If -Domain is a DC hostname, RootDSE is queried to discover defaultNamingContext.
 
     Lookup behavior:
-    - By default, -User matches sAMAccountName, userPrincipalName, or distinguishedName.
+    - Default mode uses -User and matches sAMAccountName, userPrincipalName, or distinguishedName.
     - If -LookupField and -LookupValue are specified, the script searches by that attribute instead.
 
     Output behavior:
@@ -27,7 +27,8 @@
       sAMAccountName, UPN, or DN of the user (default lookup mode).
 
     -Domain
-      Optional. Domain FQDN or DC hostname (example.com or dc01.example.com).
+      Optional. Domain FQDN, DC hostname, or BaseDN.
+      Examples: example.com, dc01.example.com, DC=example,DC=com
       If omitted, the computer's joined domain is used.
 
     -LookupField
@@ -55,7 +56,7 @@
 
     .\Export-ADUserAttributes.ps1 -LookupField uidNumber -LookupValue 123456 -Fields sAMAccountName,mail
 
-    .\Export-ADUserAttributes.ps1 -LookupField employeeID -LookupValue E12345 -Domain dc01.example.com -OutJson user.json
+    .\Export-ADUserAttributes.ps1 -LookupField uid -LookupValue mchen -Fields uid,uidNumber,gladstone_ucsfid
 #>
 
 [CmdletBinding()]
@@ -135,11 +136,17 @@ function Get-DefaultBoundDomain {
     $d
 }
 
+function Convert-DomainToBaseDN {
+    param([Parameter(Mandatory = $true)][string]$DomainName)
+    ($DomainName.Split('.') | ForEach-Object { "DC=$_" }) -join ','
+}
+
 function Get-RootDseDefaultNamingContext {
     param(
         [Parameter(Mandatory = $true)][string]$ServerOrDomain,
         [System.Management.Automation.PSCredential]$Credential = $null
     )
+
     $path = "LDAP://{0}/RootDSE" -f $ServerOrDomain
 
     try {
@@ -158,12 +165,6 @@ function Get-RootDseDefaultNamingContext {
     } catch { }
 
     return $null
-}
-
-function Convert-DomainToBaseDN {
-    param([Parameter(Mandatory = $true)][string]$DomainName)
-    # Converts example.com -> DC=example,DC=com
-    ($DomainName.Split('.') | ForEach-Object { "DC=$_" }) -join ','
 }
 
 function Resolve-LdapTargets {
@@ -192,7 +193,6 @@ function Resolve-LdapTargets {
             $server = $DomainOrServer
             $baseDn = Get-RootDseDefaultNamingContext -ServerOrDomain $server -Credential $Credential
             if (-not $baseDn) {
-                # Fall back to assuming DNS domain input.
                 $baseDn = Convert-DomainToBaseDN -DomainName $DomainOrServer
                 $server = $null
             }
@@ -206,7 +206,12 @@ function Resolve-LdapTargets {
         $server = $null
     }
 
-    $rootPath = if ($server) { "LDAP://{0}/{1}" -f $server, $baseDn } else { "LDAP://{0}" -f $baseDn }
+    $rootPath = $null
+    if ($server) {
+        $rootPath = "LDAP://{0}/{1}" -f $server, $baseDn
+    } else {
+        $rootPath = "LDAP://{0}" -f $baseDn
+    }
 
     [pscustomobject]@{
         Server         = $server
@@ -221,13 +226,21 @@ function Escape-LdapFilterValue {
     try {
         return [System.DirectoryServices.Protocols.LdapEncoder]::FilterEncode($Value)
     } catch {
-        # Minimal safe fallback.
-        $Value.Replace('\', '\5c').Replace('*', '\2a').Replace('(', '\28').Replace(')', '\29').Replace([char]0, '\00')
+        return $Value.Replace('\', '\5c').Replace('*', '\2a').Replace('(', '\28').Replace(')', '\29').Replace([char]0, '\00')
     }
 }
 
+function Normalize-FieldsCaseInsensitive {
+    param([string[]]$Fields)
+    $ht = @{}
+    foreach ($f in ($Fields | Where-Object { $_ -and $_.Trim() })) {
+        $ht[$f.Trim().ToLowerInvariant()] = $f.Trim()
+    }
+    $ht
+}
+
 # Parameter validation
-if (-not $User -and -not $LookupField) {
+if ((-not $User -or -not $User.Trim()) -and (-not $LookupField -or -not $LookupField.Trim())) {
     throw "Specify either -User, or -LookupField and -LookupValue."
 }
 if ($LookupField -and (-not $LookupValue)) {
@@ -237,12 +250,22 @@ if ($LookupValue -and (-not $LookupField)) {
     throw "-LookupField is required when -LookupValue is specified."
 }
 
-# Domain defaulting for display and AD-module server targeting
+# Capture what will be printed as Domain label, while keeping actual ADSI targeting logic separate.
+$domainLabel = $Domain
+$domainForTargets = $Domain
+
 if (-not $Domain -or -not $Domain.Trim()) {
-    $Domain = Get-DefaultBoundDomain
-    if (-not $Domain) {
-        $Domain = "<auto>"
+    $d = Get-DefaultBoundDomain
+    if (-not $d) {
+        $domainLabel = "<auto>"
+        $domainForTargets = $null
+    } else {
+        $domainLabel = $d
+        $domainForTargets = $d
     }
+} else {
+    $domainLabel = $Domain.Trim()
+    $domainForTargets = $Domain.Trim()
 }
 
 $results = @{}
@@ -259,14 +282,15 @@ try {
 if ($usedADModule) {
     try {
         $serverParam = $null
-        if ($Domain -and $Domain -ne "<auto>" -and $Domain.Trim()) {
-            $serverParam = $Domain.Trim()
+        if ($domainForTargets -and $domainForTargets.Trim()) {
+            $serverParam = $domainForTargets.Trim()
         }
+
+        $adUser = $null
 
         if ($LookupField) {
             $escapedVal = Escape-LdapFilterValue -Value $LookupValue
             $escapedField = $LookupField.Trim()
-
             $ldapFilter = "(&(objectCategory=person)(objectClass=user)($escapedField=$escapedVal))"
 
             $adParams = @{
@@ -291,7 +315,6 @@ if ($usedADModule) {
         }
 
         if (-not $adUser) {
-            if ($LookupField) { throw "User not found via Get-ADUser LDAP filter." }
             throw "User not found via Get-ADUser."
         }
 
@@ -328,7 +351,7 @@ if ($usedADModule) {
 }
 
 if (-not $usedADModule) {
-    $targets = Resolve-LdapTargets -DomainOrServer ($Domain -eq "<auto>" ? $null : $Domain) -Credential $Credential
+    $targets = Resolve-LdapTargets -DomainOrServer $domainForTargets -Credential $Credential
 
     if ($Credential) {
         $username = $Credential.UserName
@@ -382,24 +405,33 @@ if (-not $usedADModule) {
     if ($targets.Server) { $results['ADSI_Server'] = $targets.Server }
 }
 
-# Field filtering
+# If user asked for just certain attributes, filter now (case-insensitive)
 if ($Fields -and $Fields.Count -gt 0) {
+    $fieldMap = Normalize-FieldsCaseInsensitive -Fields $Fields
     $requested = @{}
-    foreach ($f in $Fields) {
-        if ($results.ContainsKey($f)) {
-            $requested[$f] = $results[$f]
+
+    foreach ($k in $fieldMap.Keys) {
+        $originalField = $fieldMap[$k]
+
+        $matchKey = $null
+        foreach ($rk in $results.Keys) {
+            if ($rk.ToLowerInvariant() -eq $k) { $matchKey = $rk; break }
+        }
+
+        if ($matchKey) {
+            $requested[$originalField] = $results[$matchKey]
         } else {
-            $requested[$f] = '<not found>'
+            $requested[$originalField] = '<not found>'
         }
     }
+
     $results = $requested
 }
 
-# Display banner
 if ($LookupField) {
-    Write-Host ("=== AD attribute dump for lookup: {0} = '{1}' (Domain: {2}) ===`n" -f $LookupField, $LookupValue, $Domain)
+    Write-Host ("=== AD attribute dump for lookup: {0} = '{1}' (Domain: {2}) ===`n" -f $LookupField, $LookupValue, $domainLabel)
 } else {
-    Write-Host ("=== AD attribute dump for '{0}' (Domain: {1}) ===`n" -f $User, $Domain)
+    Write-Host ("=== AD attribute dump for '{0}' (Domain: {1}) ===`n" -f $User, $domainLabel)
 }
 
 foreach ($key in $results.Keys | Sort-Object) {
