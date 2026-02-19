@@ -4,20 +4,9 @@
     Enumerate AD group members across domains/forests and output selected user fields.
 
   Description:
-    Retrieves group members for the specified group (by name or distinguished name) and resolves
-    each member to an AD user. Cross-domain lookups are supported by probing the member's DN-derived
-    DNS domain first, then falling back to a domain list.
-
-    Domain list behavior:
-      - If -Domains is provided, it is used for group resolution and as fallback for user resolution.
-      - If -Domains is not provided, the script attempts to discover domains from the current forest
-        (Get-ADForest).Domains. If discovery fails, current domain context is used.
-
-    Output formats:
-      - Default: one username per line (SamAccountName), sorted unique
-      - Structured: PowerShell table output if fields beyond SamAccountName are requested
-      - -Csv: CSV output
-      - -Tsv: TSV output (with quoting for fields that contain tabs/newlines/quotes)
+    Retrieves group members for the specified group and resolves each member to an AD user.
+    Cross-domain lookups are supported by probing the member's DN-derived DNS domain first,
+    then falling back to a domain list.
 
     Field selection:
       - If -Fields is provided, it defines the output columns and which AD attributes are requested.
@@ -26,44 +15,41 @@
       - If -Fields is not provided, output is built from:
           SamAccountName (always), optional -Name, optional -Email, plus -Attributes.
 
+    Account filtering:
+      - By default, disabled users and expired users are excluded:
+          * Enabled -eq $false
+          * AccountExpirationDate is set and < now
+      - Use -IncludeDisabled and/or -IncludeExpired to override.
+
   Parameters:
     -GroupName
-      Group name (sAMAccountName, CN, or distinguished name). Supports positional usage.
+      Group name (sAMAccountName, CN, or distinguished name).
 
     -Domains
       One or more domains or domain controllers to query.
 
     -Fields
       Optional. Explicit output columns / lookup fields.
-      Examples: SamAccountName,Name,Email,uidNumber,employeeID
+      Examples: SamAccountName,Name,Email,uidNumber,employeeID,uid
 
-    -Name
-      Include the AD 'Name' field (legacy behavior).
+    -Name / -Email / -Attributes
+      Legacy field selection.
 
-    -Email
-      Include the AD 'mail' attribute, output column name 'Email' (legacy behavior).
+    -IncludeDisabled
+      Include disabled user accounts.
 
-    -Attributes
-      Additional AD attributes to include (legacy behavior).
+    -IncludeExpired
+      Include expired user accounts (AccountExpirationDate in the past).
 
-    -Csv
-      Output structured results as CSV. Mutually exclusive with -Tsv.
-
-    -Tsv
-      Output structured results as TSV. Mutually exclusive with -Csv.
+    -Csv / -Tsv
+      Output as CSV or TSV.
 
   Examples:
-    # Default output: usernames only
-    .\Get-ActiveGroupMembers.ps1 "CoreHPC_Base"
+    .\Get-ActiveGroupMembers.ps1 "Domain Users"
 
-    # Legacy behavior
-    .\Get-ActiveGroupMembers.ps1 "CoreHPC_Base" -Name -Email -Attributes EmployeeID,LastLogonDate
+    .\Get-ActiveGroupMembers.ps1 "Domain Users" -Fields SamAccountName,Name,Email,uid -Tsv
 
-    # Explicit fields (drives lookup + output)
-    .\Get-ActiveGroupMembers.ps1 "CoreHPC_Base" -Fields SamAccountName,Name,Email,uidNumber -Tsv
-
-    # CSV with explicit fields
-    .\Get-ActiveGroupMembers.ps1 "CoreHPC_Base" -Fields SamAccountName,Email,Department -Csv
+    .\Get-ActiveGroupMembers.ps1 "Domain Users" -Fields SamAccountName,Email -IncludeDisabled
 #>
 
 [CmdletBinding()]
@@ -88,6 +74,12 @@ param(
     [string[]]$Attributes = @(),
 
     [Parameter(Mandatory = $false)]
+    [switch]$IncludeDisabled,
+
+    [Parameter(Mandatory = $false)]
+    [switch]$IncludeExpired,
+
+    [Parameter(Mandatory = $false)]
     [switch]$Csv,
 
     [Parameter(Mandatory = $false)]
@@ -104,10 +96,6 @@ if ($Csv -and $Tsv) {
 Import-Module ActiveDirectory -ErrorAction Stop
 
 function Get-DomainFromDistinguishedName {
-    <#
-    .SYNOPSIS
-        Converts a DN to a DNS domain name, if DC components are present.
-    #>
     param(
         [Parameter(Mandatory=$true)]
         [string]$DistinguishedName
@@ -129,15 +117,6 @@ function Get-DomainFromDistinguishedName {
 }
 
 function Get-FallbackDomainList {
-    <#
-    .SYNOPSIS
-        Builds a domain list to try for group/user lookups.
-    .DESCRIPTION
-        Preference order:
-          1) Explicit -Domains parameter
-          2) Current forest domains (Get-ADForest).Domains
-          3) Empty (meaning: rely on current domain context only)
-    #>
     param(
         [Parameter(Mandatory=$false)]
         [AllowNull()]
@@ -162,13 +141,6 @@ function Get-FallbackDomainList {
 }
 
 function Get-ADUserCrossDomain {
-    <#
-    .SYNOPSIS
-        Attempts to resolve a group member DN to an AD user across domains.
-    .DESCRIPTION
-        First attempts lookup in the DN-derived DNS domain, then falls back to a provided domain list.
-        Failed attempts are suppressed and the next domain is tried.
-    #>
     param(
         [Parameter(Mandatory=$true)]
         [string]$DistinguishedName,
@@ -208,10 +180,6 @@ function Get-ADUserCrossDomain {
 }
 
 function Resolve-ADGroupCrossDomain {
-    <#
-    .SYNOPSIS
-        Resolves an AD group by identity across domains.
-    #>
     param(
         [Parameter(Mandatory=$true)]
         [string]$Identity,
@@ -236,10 +204,6 @@ function Resolve-ADGroupCrossDomain {
 }
 
 function Get-ADGroupMembersCrossDomain {
-    <#
-    .SYNOPSIS
-        Enumerates members of a resolved group using a known-good server hint.
-    #>
     param(
         [Parameter(Mandatory=$true)]
         [Microsoft.ActiveDirectory.Management.ADGroup]$Group,
@@ -275,12 +239,6 @@ function Get-ADGroupMembersCrossDomain {
 }
 
 function ConvertTo-Tsv {
-    <#
-    .SYNOPSIS
-        Converts objects into TSV text.
-    .DESCRIPTION
-        Outputs header + rows. Fields containing tab/newline/quote are quoted and quotes are doubled.
-    #>
     param(
         [Parameter(Mandatory=$true)]
         [object[]]$InputObject,
@@ -321,16 +279,35 @@ function Normalize-UniqueNonEmpty {
         Select-Object -Unique
 }
 
-function Build-FieldPlan {
+function Convert-ADValueToDisplayString {
     <#
-    .SYNOPSIS
-        Builds output column plan and AD property request list.
-    .DESCRIPTION
-        Returns:
-          - OutColumns: ordered list of output column names
-          - AdProps: AD properties to request via Get-ADUser
-          - ColumnToAdProp: mapping output column -> AD property name
+      Normalizes AD property values for table/CSV/TSV output.
+      - Multi-valued collections become a '; ' joined string.
+      - Byte arrays become "BINARY (N bytes)".
     #>
+    param([AllowNull()][object]$Value)
+
+    if ($null -eq $Value) { return $null }
+
+    if ($Value -is [byte[]]) {
+        return ("BINARY ({0} bytes)" -f $Value.Length)
+    }
+
+    # Treat ADPropertyValueCollection and any other IEnumerable (except string) as multi-valued.
+    if (($Value -is [System.Collections.IEnumerable]) -and -not ($Value -is [string])) {
+        $items = @()
+        foreach ($item in $Value) {
+            if ($null -eq $item) { continue }
+            if ($item -is [byte[]]) { $items += ("BINARY ({0} bytes)" -f $item.Length) }
+            else { $items += [string]$item }
+        }
+        return ($items -join '; ')
+    }
+
+    return [string]$Value
+}
+
+function Build-FieldPlan {
     param(
         [string[]]$ExplicitFields,
         [switch]$LegacyName,
@@ -399,6 +376,37 @@ function Build-FieldPlan {
     }
 }
 
+function Test-UserIsActive {
+    <#
+      Returns $true if the account should be included, based on Enabled/expiration filters.
+    #>
+    param(
+        [Parameter(Mandatory=$true)]
+        [Microsoft.ActiveDirectory.Management.ADUser]$UserObject,
+
+        [switch]$IncludeDisabled,
+        [switch]$IncludeExpired
+    )
+
+    if (-not $IncludeDisabled) {
+        # Enabled can be $null for some edge cases; treat $false explicitly as disabled.
+        if ($UserObject.PSObject.Properties.Match('Enabled').Count -gt 0) {
+            if ($UserObject.Enabled -eq $false) { return $false }
+        }
+    }
+
+    if (-not $IncludeExpired) {
+        if ($UserObject.PSObject.Properties.Match('AccountExpirationDate').Count -gt 0) {
+            $aed = $UserObject.AccountExpirationDate
+            if ($aed -is [DateTime]) {
+                if ($aed -lt (Get-Date)) { return $false }
+            }
+        }
+    }
+
+    return $true
+}
+
 # Build domain list
 $fallbackDomains = Get-FallbackDomainList -ExplicitDomains $Domains
 
@@ -425,48 +433,61 @@ $outProps = $fieldPlan.OutColumns
 $adProps = $fieldPlan.AdProps
 $colToProp = $fieldPlan.ColumnToAdProp
 
+# Always request these for filtering (even if not output)
+$requiredForFilter = @('Enabled', 'AccountExpirationDate')
+foreach ($rf in $requiredForFilter) {
+    if ($adProps -notcontains $rf) {
+        $adProps = @($adProps + $rf)
+    }
+}
+
 # Determine whether structured output is needed
 $needsStructured = $false
-
-# Explicit fields means structured unless it is only SamAccountName and no forced formatting.
 if ($fieldPlan.UsesExplicit) {
     if ($outProps.Count -gt 1) { $needsStructured = $true }
 } else {
     if ($Name -or $Email -or ($Attributes.Count -gt 0)) { $needsStructured = $true }
 }
-
 if ($Csv -or $Tsv) { $needsStructured = $true }
 
-# If still not structured, output usernames only
+# If still not structured, output usernames only (but still apply active filters)
 if (-not $needsStructured) {
     $namesOnly = New-Object System.Collections.Generic.List[string]
     foreach ($m in $members) {
         if ($m.objectClass -ne 'user') { continue }
-        if ($m.SamAccountName) { [void]$namesOnly.Add([string]$m.SamAccountName) }
+        if (-not $m.DistinguishedName) { continue }
+
+        $u = Get-ADUserCrossDomain -DistinguishedName $m.DistinguishedName -Properties $adProps -FallbackDomains $fallbackDomains
+        if (-not $u) { continue }
+
+        if (-not (Test-UserIsActive -UserObject $u -IncludeDisabled:$IncludeDisabled -IncludeExpired:$IncludeExpired)) {
+            continue
+        }
+
+        if ($u.SamAccountName) { [void]$namesOnly.Add([string]$u.SamAccountName) }
     }
     $namesOnly | Sort-Object -Unique
     exit 0
 }
 
-# Resolve each member to an AD user for property retrieval and build output rows
+# Structured output: build rows with normalized display values, apply active filters
 $results = New-Object System.Collections.Generic.List[object]
 
 foreach ($m in $members) {
     if ($m.objectClass -ne 'user') { continue }
+    if (-not $m.DistinguishedName) { continue }
 
-    $u = $null
-    if ($m.DistinguishedName) {
-        $u = Get-ADUserCrossDomain -DistinguishedName $m.DistinguishedName -Properties $adProps -FallbackDomains $fallbackDomains
-    }
+    $u = Get-ADUserCrossDomain -DistinguishedName $m.DistinguishedName -Properties $adProps -FallbackDomains $fallbackDomains
+    if (-not $u) { continue }
 
-    if (-not $u) {
+    if (-not (Test-UserIsActive -UserObject $u -IncludeDisabled:$IncludeDisabled -IncludeExpired:$IncludeExpired)) {
         continue
     }
 
     $row = [ordered]@{}
     foreach ($col in $outProps) {
         $adProp = $colToProp[$col]
-        $row[$col] = $u.$adProp
+        $row[$col] = Convert-ADValueToDisplayString -Value ($u.$adProp)
     }
 
     [void]$results.Add([pscustomobject]$row)
