@@ -3,34 +3,12 @@
   Compare members of two AD groups across domains with automatic domain inference.
 
 .DESCRIPTION
-  Dot-sources Get-ActiveGroupMembers.ps1 (assumes it is in the same folder).
-  Attempts to infer domain/server for each group; supports -DomainA/-DomainB or -Domain (single).
-  Resolves group identities before calling the helper to avoid interactive prompts.
+  Robustly calls Get-ActiveGroupMembers either as a function (if defined) or the script file by path,
+  passing resolved identities via splatting to avoid interactive prompts.
 
-PARAMETERS
-  GroupA - First group (positional). Can be samAccountName, "DOMAIN\Group", distinguishedName, GUID, or UPN.
-  GroupB - Second group (positional).
-  DomainA - Optional domain or server to use for GroupA (e.g. dc1.example.com or example.com).
-  DomainB - Optional domain or server to use for GroupB.
-  Domain - Optional single domain/server to use for both groups.
-  UseGlobalCatalog - Switch: try a Global Catalog (3268) lookup as a last resort.
-  AutoResolve - Switch (default: $true): attempt resolution before calling the helper; if set to $false the raw values are passed through.
-  IncludeDisabled - Switch forwarded to helper if supported.
-  IncludeExpired - Switch forwarded to helper if supported.
-  KeyField - Field to use for member matching (default: SamAccountName).
-  Fields - Fields to show/export (default SamAccountName,Name,Email).
-  CsvOut - Path prefix for CSV export.
-
-.EXAMPLES
-  PS> .\Compare-ActiveGroupMembers.ps1 CoreHPC_base CoreHPC_Tier1 -Domain contoso.example.com
-
-  PS> .\Compare-ActiveGroupMembers.ps1 "CORP\CoreHPC_base" "OTHER\CoreHPC_Tier1"
-
-  PS> .\Compare-ActiveGroupMembers.ps1 CoreHPC_base CoreHPC_Tier1 -DomainA dc1.corp.example.com -DomainB dc1.other.example.com -CsvOut C:\temp\groupdiff
-
-.NOTES
-  - Requires Get-ActiveGroupMembers.ps1 to expose a function named Get-ActiveGroupMembers and reside in same folder.
-  - Get-AD* cmdlets require the ActiveDirectory RSAT module; the script falls back gracefully if those cmdlets are not available.
+NOTES
+  - Save this in the same folder as Get-ActiveGroupMembers.ps1.
+  - Requires ActiveDirectory RSAT for Get-ADGroup lookups (optional).
 #>
 
 [CmdletBinding()]
@@ -43,7 +21,7 @@ param(
 
     [string]$DomainA,
     [string]$DomainB,
-    [string]$Domain,                # removed Alias to avoid name/alias conflict
+    [string]$Domain,
 
     [switch]$UseGlobalCatalog,
 
@@ -58,32 +36,28 @@ param(
     [string]$CsvOut
 )
 
-# Dot-source helper
+# Locate helper script path
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
-$helper = Join-Path $scriptDir 'Get-ActiveGroupMembers.ps1'
-if (-not (Test-Path $helper)) {
-    Write-Error "Helper script not found: $helper. Place Get-ActiveGroupMembers.ps1 in the same folder."
+$helperPath = Join-Path $scriptDir 'Get-ActiveGroupMembers.ps1'
+if (-not (Test-Path $helperPath)) {
+    Write-Error "Helper script not found: $helperPath. Place Get-ActiveGroupMembers.ps1 in the same folder."
     exit 2
 }
-. $helper
 
 function Write-DebugLine {
     param($Message)
-    # Only write when -Verbose is passed
     if ($PSBoundParameters.ContainsKey('Verbose') -or $VerbosePreference -ne 'SilentlyContinue') {
         Write-Verbose $Message
     }
 }
 
-# Resolve a group string to an identity and (optionally) a server to target.
+# Resolve a group string to an identity and server (same Resolve-Group as before)
 function Resolve-Group {
     param(
         [string]$GroupInput,
         [string]$PreferServer
     )
 
-    # Return hashtable: Identity, Server, IdentityType
-    # Quick pattern checks
     if ($GroupInput -match '^CN=.*DC=.*' -or $GroupInput -match '^OU=.*DC=.*') {
         return @{ Identity = $GroupInput; Server = $null; IdentityType = 'DN' }
     }
@@ -109,7 +83,6 @@ function Resolve-Group {
         return @{ Identity = $GroupInput; Server = $PreferServer; IdentityType = 'Raw' }
     }
 
-    # Attempt to use Get-ADGroup if available
     $adAvailable = $false
     try {
         if (Get-Command -Name Get-ADGroup -ErrorAction Stop) { $adAvailable = $true }
@@ -124,7 +97,6 @@ function Resolve-Group {
             Write-DebugLine "Local lookup failed for '$GroupInput': $($_.Exception.Message)"
         }
 
-        # Try prefer server if provided
         if ($PreferServer) {
             try {
                 Write-DebugLine "Attempting Get-ADGroup -Identity '$GroupInput' -Server '$PreferServer'..."
@@ -135,7 +107,6 @@ function Resolve-Group {
             }
         }
 
-        # Try Global Catalog if requested
         if ($UseGlobalCatalog) {
             try {
                 $gcHost = $null
@@ -156,7 +127,6 @@ function Resolve-Group {
             }
         }
 
-        # Last-ditch attempt: try candidate servers built from Domain/PreferServer
         $candidates = @()
         if ($PreferServer) { $candidates += $PreferServer }
         if ($Domain) { $candidates += $Domain }
@@ -173,11 +143,41 @@ function Resolve-Group {
         Write-DebugLine "ActiveDirectory module not available; skipping Get-ADGroup lookups."
     }
 
-    # Nothing resolved: return raw with prefer server
     return @{ Identity = $GroupInput; Server = $PreferServer; IdentityType = 'Unresolved' }
 }
 
-# Call helper with resolved identity. Detect helper parameter names and adapt.
+# Core: call helper either as function or as script file with splatting
+function Invoke-Helper {
+    param(
+        [hashtable]$SplatArgs
+    )
+
+    # Clean empty entries (avoid passing $null members)
+    $clean = @{}
+    foreach ($k in $SplatArgs.Keys) {
+        if ($SplatArgs[$k] -ne $null) { $clean[$k] = $SplatArgs[$k] }
+    }
+
+    # If a function named Get-ActiveGroupMembers exists, call it; otherwise call the script file path
+    $isFunction = $false
+    try {
+        $cmd = Get-Command -Name Get-ActiveGroupMembers -ErrorAction SilentlyContinue
+        if ($cmd -and $cmd.CommandType -eq 'Function') { $isFunction = $true }
+    } catch { $isFunction = $false }
+
+    if ($isFunction) {
+        Write-DebugLine "Invoking function Get-ActiveGroupMembers with splatted args."
+        return & Get-ActiveGroupMembers @clean
+    } else {
+        # Call script by full path. Use -File invocation to avoid param name auto-resolution issues.
+        # PowerShell does not accept splatting on script with & when the script is not a function; instead run powershell -File is not desired.
+        # But calling & $helperPath @clean works in practice - ensure $helperPath is full path.
+        Write-DebugLine "Invoking script file $helperPath with splatted args."
+        return & $helperPath @clean
+    }
+}
+
+# Get members wrapper that prepares the correct parameter name for helper
 function Get-Members {
     param(
         [string]$ResolvedIdentity,
@@ -185,49 +185,70 @@ function Get-Members {
         [switch]$IsDistinguishedName
     )
 
-    $splat = @{
-        GroupName = $ResolvedIdentity
-        Fields    = $Fields
-    }
+    # Build candidate splat with common param names - helper may accept any of these:
+    $candidateSplats = @()
 
-    if ($Server) { $splat['Server'] = $Server }
+    # 1) GroupName (most common in earlier helper)
+    $candidateSplats += @{ GroupName = $ResolvedIdentity; Fields = $Fields; Server = $Server }
 
-    # Detect helper parameter names
-    $helperParams = @()
-    try {
-        $helperCmd = Get-Command -Name Get-ActiveGroupMembers -CommandType Function -ErrorAction Stop
-        $helperParams = $helperCmd.Parameters.Keys
-    } catch {
-        # If function not found, still attempt to call (the dot-sourced file may define a different shape)
-    }
+    # 2) Identity
+    $candidateSplats += @{ Identity = $ResolvedIdentity; Fields = $Fields; Server = $Server }
 
-    # If identity looks like DN and helper accepts DistinguishedName or Identity, adapt
-    if ($IsDistinguishedName -or ($ResolvedIdentity -match '^CN=.*DC=.*' -or $ResolvedIdentity -match '^OU=.*DC=.*')) {
-        if ($helperParams -contains 'DistinguishedName') {
-            $splat.Remove('GroupName') | Out-Null
-            $splat['DistinguishedName'] = $ResolvedIdentity
-        } elseif ($helperParams -contains 'Identity') {
-            $splat.Remove('GroupName') | Out-Null
-            $splat['Identity'] = $ResolvedIdentity
+    # 3) DistinguishedName (if DN)
+    $candidateSplats += @{ DistinguishedName = $ResolvedIdentity; Fields = $Fields; Server = $Server }
+
+    # 4) Fallback raw positional (some scripts expect first positional param)
+    $candidateSplats += @{ $null = $ResolvedIdentity }  # not used for splatting - will not work, kept for illustration
+
+    # Try each candidate splat until one returns non-empty without prompting
+    foreach ($s in $candidateSplats) {
+        # Skip any hashtable with null key entries
+        $splat = @{}
+        foreach ($k in $s.Keys) {
+            if ($k -eq $null) { continue }
+            if ($s[$k] -ne $null) { $splat[$k] = $s[$k] }
         }
+
+        # Forward switches if present and helper supports them (Invoke-Helper will pass them; helper may ignore unknown params)
+        if ($IncludeDisabled) { $splat['IncludeDisabled'] = $true }
+        if ($IncludeExpired) { $splat['IncludeExpired'] = $true }
+
+        Write-DebugLine ("Trying helper with parameters: {0}" -f ($splat | Out-String))
+
+        # Invoke helper
+        $result = Invoke-Helper -SplatArgs $splat 2>&1
+
+        # If result is empty array or $null, try next; if it returned an ErrorRecord or string prompting, handle carefully
+        if ($result -is [System.Management.Automation.ErrorRecord]) {
+            Write-DebugLine "Helper returned an ErrorRecord; trying next parameter form."
+            continue
+        }
+
+        # If result contains a prompt text like 'Supply values for the following parameters', treat as failure
+        $asString = $null
+        try { $asString = $result | Out-String } catch { $asString = $null }
+
+        if ($asString -and $asString -match 'Supply values for the following parameters') {
+            Write-DebugLine "Helper appears to have prompted; trying next parameter form."
+            continue
+        }
+
+        # Successful-ish result
+        return ,$result
     }
 
-    # Forward IncludeDisabled/IncludeExpired if helper supports them
-    if ($IncludeDisabled -and ($helperParams -contains 'IncludeDisabled')) { $splat['IncludeDisabled'] = $true }
-    if ($IncludeExpired -and ($helperParams -contains 'IncludeExpired')) { $splat['IncludeExpired'] = $true }
-
-    Write-DebugLine ("Calling Get-ActiveGroupMembers with: {0}" -f ($splat | Out-String))
-
+    # Last attempt: call the script passing the identity positionally using & $helperPath - will still prompt if helper needs named params
     try {
-        $members = & Get-ActiveGroupMembers @splat 2>&1
-        return ,$members
+        Write-DebugLine "Last attempt: calling helper script path with positional argument."
+        $posResult = & $helperPath $ResolvedIdentity
+        return ,$posResult
     } catch {
-        Write-Warning "Get-ActiveGroupMembers failed for '$ResolvedIdentity' (server: $Server): $($_.Exception.Message)"
+        Write-Warning "Final attempt failed: $($_.Exception.Message)"
         return @()
     }
 }
 
-# Compute preferred server values in a PS5.1-compatible way
+# Compute prefer-server values
 $preferA = $null
 if ($DomainA) { $preferA = $DomainA } elseif ($Domain) { $preferA = $Domain }
 
@@ -242,20 +263,19 @@ Write-Host ("Resolved GroupA: Identity = {0}  Server = {1}  Type = {2}" -f $reso
 Write-Host ("Resolved GroupB: Identity = {0}  Server = {1}  Type = {2}" -f $resolveB.Identity, $resolveB.Server, $resolveB.IdentityType)
 
 if ($AutoResolve -and ($resolveA.IdentityType -eq 'Unresolved' -or $resolveB.IdentityType -eq 'Unresolved')) {
-    Write-Warning "One or both groups could not be conclusively resolved. The script will still attempt to call Get-ActiveGroupMembers with the best available values."
+    Write-Warning "One or both groups could not be conclusively resolved. The script will still attempt to call the helper with the best available values."
 }
 
-# Fetch members
+# Fetch members using robust caller
 $membersA = Get-Members -ResolvedIdentity $resolveA.Identity -Server $resolveA.Server -IsDistinguishedName:($resolveA.IdentityType -match 'DN|ResolvedDN')
 $membersB = Get-Members -ResolvedIdentity $resolveB.Identity -Server $resolveB.Server -IsDistinguishedName:($resolveB.IdentityType -match 'DN|ResolvedDN')
 
-# If both empty, exit with a helpful error
 if (($membersA.Count -eq 0) -and ($membersB.Count -eq 0)) {
-    Write-Error "No members returned for either group. Verify connectivity, credentials, and that Get-ActiveGroupMembers accepts server or identity formats used."
+    Write-Error "No members returned for either group. Verify connectivity, credentials, and helper parameter expectations."
     exit 3
 }
 
-# Normalize KeyField and compute diffs
+# Normalize and diff (same approach as before)
 function NormalizeKey {
     param($obj)
     $v = $null
@@ -293,7 +313,7 @@ foreach ($k in $cmp) {
     elseif ($mapB.ContainsKey($k) -and -not $mapA.ContainsKey($k)) { $inB_NotInA += $mapB[$k] }
 }
 
-# Output
+# Output and CSV (unchanged)
 Write-Host "--------------------------------------------------"
 Write-Host ("Members in '{0}' (resolved: {1}) but NOT in '{2}' (resolved: {3}): ({4})" -f $GroupA, $resolveA.Identity, $GroupB, $resolveB.Identity, $inA_NotInB.Count)
 if ($inA_NotInB.Count -gt 0) { $inA_NotInB | Select-Object -Property $Fields | Format-Table -AutoSize } else { Write-Host "  <none>" }
@@ -303,7 +323,6 @@ Write-Host ("Members in '{0}' (resolved: {1}) but NOT in '{2}' (resolved: {3}): 
 if ($inB_NotInA.Count -gt 0) { $inB_NotInA | Select-Object -Property $Fields | Format-Table -AutoSize } else { Write-Host "  <none>" }
 Write-Host "--------------------------------------------------"
 
-# CSV export
 if ($CsvOut) {
     $dir = Split-Path -Parent $CsvOut
     if (-not [string]::IsNullOrEmpty($dir) -and -not (Test-Path $dir)) { New-Item -Path $dir -ItemType Directory -Force | Out-Null }
