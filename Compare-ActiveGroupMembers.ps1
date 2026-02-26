@@ -3,12 +3,15 @@
   Compare members of two AD groups across domains with automatic domain inference.
 
 .DESCRIPTION
-  Robustly calls Get-ActiveGroupMembers either as a function (if defined) or the script file by path,
-  passing resolved identities via splatting to avoid interactive prompts.
+  - Dot-sources / invokes Get-ActiveGroupMembers.ps1 (helper must be in same folder).
+  - Attempts to infer domain/server for each group; supports -DomainA/-DomainB or -Domain (single).
+  - Exits if either group cannot be resolved (no fallbacks).
+  - Filters out completely-empty member objects before formatting output.
+  - Prints a clear message if memberships are identical.
 
-NOTES
-  - Save this in the same folder as Get-ActiveGroupMembers.ps1.
-  - Requires ActiveDirectory RSAT for Get-ADGroup lookups (optional).
+.NOTES
+  - PowerShell 5.1 compatible.
+  - If the helper still prompts, paste the helper's param block and the script will be adjusted to its exact parameter names.
 #>
 
 [CmdletBinding()]
@@ -36,7 +39,7 @@ param(
     [string]$CsvOut
 )
 
-# Locate helper script path
+# Helper script path (must exist)
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
 $helperPath = Join-Path $scriptDir 'Get-ActiveGroupMembers.ps1'
 if (-not (Test-Path $helperPath)) {
@@ -44,90 +47,71 @@ if (-not (Test-Path $helperPath)) {
     exit 2
 }
 
-function Write-DebugLine {
-    param($Message)
-    if ($PSBoundParameters.ContainsKey('Verbose') -or $VerbosePreference -ne 'SilentlyContinue') {
-        Write-Verbose $Message
-    }
-}
+function Write-DebugLine { param($M) if ($PSBoundParameters.ContainsKey('Verbose') -or $VerbosePreference -ne 'SilentlyContinue') { Write-Verbose $M } }
 
 # Resolve a group string to an identity and server
 function Resolve-Group {
-    param(
-        [string]$GroupInput,
-        [string]$PreferServer
-    )
+    param([string]$GroupInput,[string]$PreferServer)
 
+    # Recognize obvious formats first
     if ($GroupInput -match '^CN=.*DC=.*' -or $GroupInput -match '^OU=.*DC=.*') {
         return @{ Identity = $GroupInput; Server = $null; IdentityType = 'DN' }
     }
-
     if ($GroupInput -match '^[^\\]+\\.+') {
         $parts = $GroupInput.Split('\',2)
         return @{ Identity = $parts[1]; Server = $parts[0]; IdentityType = 'SAM_WITH_DOMAIN' }
     }
-
     if ($GroupInput -match '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$') {
         return @{ Identity = $GroupInput; Server = $null; IdentityType = 'GUID' }
     }
-
     if ($GroupInput -match '^S-\d-\d+-.+') {
         return @{ Identity = $GroupInput; Server = $null; IdentityType = 'SID' }
     }
-
     if ($GroupInput -match '@') {
         return @{ Identity = $GroupInput; Server = $null; IdentityType = 'UPN' }
     }
 
+    # If AutoResolve disabled, pass raw plus prefer-server if present
     if (-not $AutoResolve) {
         return @{ Identity = $GroupInput; Server = $PreferServer; IdentityType = 'Raw' }
     }
 
-    # Try AD cmdlets if available
+    # Try AD cmdlets (Get-ADGroup) if available
     $adAvailable = $false
-    try {
-        if (Get-Command -Name Get-ADGroup -ErrorAction Stop) { $adAvailable = $true }
-    } catch { $adAvailable = $false }
+    try { if (Get-Command -Name Get-ADGroup -ErrorAction Stop) { $adAvailable = $true } } catch { $adAvailable = $false }
 
     if ($adAvailable) {
         try {
             Write-DebugLine "Attempting Get-ADGroup -Identity '$GroupInput' (no server)..."
             $g = Get-ADGroup -Identity $GroupInput -ErrorAction Stop
             return @{ Identity = $g.DistinguishedName; Server = $g.DNSHostName; IdentityType = 'ResolvedDN' }
-        } catch {
-            Write-DebugLine "Local lookup failed for '$GroupInput': $($_.Exception.Message)"
-        }
+        } catch { Write-DebugLine "Local lookup failed: $($_.Exception.Message)" }
 
         if ($PreferServer) {
             try {
                 Write-DebugLine "Attempting Get-ADGroup -Identity '$GroupInput' -Server '$PreferServer'..."
                 $g2 = Get-ADGroup -Identity $GroupInput -Server $PreferServer -ErrorAction Stop
                 return @{ Identity = $g2.DistinguishedName; Server = $PreferServer; IdentityType = 'ResolvedDN' }
-            } catch {
-                Write-DebugLine "Lookup at server '$PreferServer' failed: $($_.Exception.Message)"
-            }
+            } catch { Write-DebugLine "Prefer-server lookup failed: $($_.Exception.Message)" }
         }
 
         if ($UseGlobalCatalog) {
             try {
-                $gcHost = $null
                 $gcdcs = Get-ADDomainController -Filter {IsGlobalCatalog -eq $true} -ErrorAction SilentlyContinue
+                $gcHost = $null
                 if ($gcdcs) { $gcHost = ($gcdcs | Select-Object -First 1).HostName + ':3268' }
-
                 if (-not $gcHost) {
-                    if ($Domain) { $gcHost = "$Domain:3268" }
-                    elseif ($PreferServer) { $gcHost = "$PreferServer:3268" }
+                    if ($Domain) { $gcHost = "$Domain:3268" } elseif ($PreferServer) { $gcHost = "$PreferServer:3268" }
                 }
                 if ($gcHost) {
                     Write-DebugLine "Attempting GC lookup on $gcHost..."
                     $g3 = Get-ADGroup -Identity $GroupInput -Server $gcHost -ErrorAction Stop
                     return @{ Identity = $g3.DistinguishedName; Server = $gcHost; IdentityType = 'ResolvedDN' }
                 }
-            } catch {
-                Write-DebugLine "GC lookup failed: $($_.Exception.Message)"
-            }
+            } catch { Write-DebugLine "GC lookup failed: $($_.Exception.Message)" }
         }
 
+        # Try candidate servers
         $candidates = @()
         if ($PreferServer) { $candidates += $PreferServer }
         if ($Domain) { $candidates += $Domain }
@@ -136,98 +120,73 @@ function Resolve-Group {
                 Write-DebugLine "Attempting Get-ADGroup -Identity '$GroupInput' -Server '$cand'..."
                 $g4 = Get-ADGroup -Identity $GroupInput -Server $cand -ErrorAction Stop
                 return @{ Identity = $g4.DistinguishedName; Server = $cand; IdentityType = 'ResolvedDN' }
-            } catch {
-                Write-DebugLine "Candidate server lookup failed: $($_.Exception.Message)"
-            }
+            } catch { Write-DebugLine "Candidate lookup failed: $($_.Exception.Message)" }
         }
     } else {
-        Write-DebugLine "ActiveDirectory module not available; skipping Get-ADGroup lookups."
+        Write-DebugLine "ActiveDirectory module not present; skipping AD lookups."
     }
 
+    # Unresolved
     return @{ Identity = $GroupInput; Server = $PreferServer; IdentityType = 'Unresolved' }
 }
 
-# Invoke helper as function or script file
+# Invoke helper either as function or script file
 function Invoke-Helper {
-    param(
-        [hashtable]$SplatArgs
-    )
-
-    # Clean empty entries
+    param([hashtable]$SplatArgs)
     $clean = @{}
-    foreach ($k in $SplatArgs.Keys) {
-        if ($SplatArgs[$k] -ne $null) { $clean[$k] = $SplatArgs[$k] }
-    }
+    foreach ($k in $SplatArgs.Keys) { if ($SplatArgs[$k] -ne $null) { $clean[$k] = $SplatArgs[$k] } }
 
-    # Detect function
     $isFunction = $false
     try {
         $cmd = Get-Command -Name Get-ActiveGroupMembers -ErrorAction SilentlyContinue
         if ($cmd -and $cmd.CommandType -eq 'Function') { $isFunction = $true }
-    } catch { $isFunction = $false }
+    } catch {}
 
     if ($isFunction) {
-        Write-DebugLine "Invoking function Get-ActiveGroupMembers with splatted args."
+        Write-DebugLine "Invoking function Get-ActiveGroupMembers"
         return & Get-ActiveGroupMembers @clean
     } else {
-        Write-DebugLine "Invoking script file $helperPath with splatted args."
+        Write-DebugLine "Invoking script file $helperPath"
         return & $helperPath @clean
     }
 }
 
-# Build and try several splat forms, then fallback to positional call
+# Try common param names; final fallback is positional script call
 function Get-Members {
-    param(
-        [string]$ResolvedIdentity,
-        [string]$Server,
-        [switch]$IsDistinguishedName
-    )
+    param([string]$ResolvedIdentity,[string]$Server,[switch]$IsDistinguishedName)
 
-    # Candidate splats with common parameter names
     $candidateSplats = @()
-
     $candidateSplats += @{ GroupName = $ResolvedIdentity; Fields = $Fields; Server = $Server }
     $candidateSplats += @{ Identity = $ResolvedIdentity; Fields = $Fields; Server = $Server }
     $candidateSplats += @{ DistinguishedName = $ResolvedIdentity; Fields = $Fields; Server = $Server }
 
     foreach ($splat in $candidateSplats) {
-        # Forward switches if present
         if ($IncludeDisabled) { $splat['IncludeDisabled'] = $true }
         if ($IncludeExpired) { $splat['IncludeExpired'] = $true }
 
-        # Remove null values
         $clean = @{}
-        foreach ($k in $splat.Keys) {
-            if ($splat[$k] -ne $null) { $clean[$k] = $splat[$k] }
-        }
+        foreach ($k in $splat.Keys) { if ($splat[$k] -ne $null) { $clean[$k] = $splat[$k] } }
 
-        Write-DebugLine ("Trying helper with parameters: {0}" -f ($clean | Out-String))
+        Write-DebugLine ("Trying helper with: {0}" -f ($clean | Out-String))
 
-        try {
-            $result = Invoke-Helper -SplatArgs $clean 2>&1
-        } catch {
-            Write-DebugLine "Invoke-Helper threw: $($_.Exception.Message)"
-            $result = $null
-        }
+        try { $result = Invoke-Helper -SplatArgs $clean 2>&1 } catch { Write-DebugLine "Invoke-Helper threw: $($_.Exception.Message)"; $result = $null }
 
         if ($result -eq $null) { continue }
 
-        # Convert to string to detect prompt text
         $asString = $null
-        try { $asString = $result | Out-String } catch { $asString = $null }
-
+        try { $asString = $result | Out-String } catch {}
         if ($asString -and $asString -match 'Supply values for the following parameters') {
-            Write-DebugLine "Helper appears to have prompted; trying next parameter form."
+            Write-DebugLine "Helper prompted - trying next param form."
             continue
         }
 
-        # Otherwise return whatever was returned (could be empty array)
+        # Return result (could be empty collection)
         return ,$result
     }
 
-    # Final fallback: call script with positional arg (may still prompt if helper requires named params)
+    # Final positional attempt (may prompt)
     try {
-        Write-DebugLine "Final fallback: calling script path with positional identity."
+        Write-DebugLine "Final positional call to helper script path"
         $posResult = & $helperPath $ResolvedIdentity
         return ,$posResult
     } catch {
@@ -236,10 +195,21 @@ function Get-Members {
     }
 }
 
-# Compute prefer-server
+# Helper: return true if object has any non-empty value in any of $Fields
+function HasAnyField {
+    param($obj, [string[]]$checkFields)
+    foreach ($f in $checkFields) {
+        if ($null -ne $obj.PSObject.Properties.Match($f)) {
+            $val = $obj.PSObject.Properties[$f].Value
+            if ($val -ne $null -and -not ([string]::IsNullOrWhiteSpace([string]$val))) { return $true }
+        }
+    }
+    return $false
+}
+
+# Compute prefer-server values (PS5.1-safe)
 $preferA = $null
 if ($DomainA) { $preferA = $DomainA } elseif ($Domain) { $preferA = $Domain }
-
 $preferB = $null
 if ($DomainB) { $preferB = $DomainB } elseif ($Domain) { $preferB = $Domain }
 
@@ -247,23 +217,30 @@ if ($DomainB) { $preferB = $DomainB } elseif ($Domain) { $preferB = $Domain }
 $resolveA = Resolve-Group -GroupInput $GroupA -PreferServer $preferA
 $resolveB = Resolve-Group -GroupInput $GroupB -PreferServer $preferB
 
-Write-Host ("Resolved GroupA: Identity = {0}  Server = {1}  Type = {2}" -f $resolveA.Identity, $resolveA.Server, $resolveA.IdentityType)
-Write-Host ("Resolved GroupB: Identity = {0}  Server = {1}  Type = {2}" -f $resolveB.Identity, $resolveB.Server, $resolveB.IdentityType)
+# Tighten server display to show <none> when empty
+$serverA = if ($resolveA.Server) { $resolveA.Server } else { '<none>' }
+$serverB = if ($resolveB.Server) { $resolveB.Server } else { '<none>' }
 
-if ($AutoResolve -and ($resolveA.IdentityType -eq 'Unresolved' -or $resolveB.IdentityType -eq 'Unresolved')) {
-    Write-Warning "One or both groups could not be conclusively resolved. The script will still attempt to call the helper with the best available values."
+Write-Host ("Resolved GroupA: Identity = {0}  Server = {1}  Type = {2}" -f $resolveA.Identity, $serverA, $resolveA.IdentityType)
+Write-Host ("Resolved GroupB: Identity = {0}  Server = {1}  Type = {2}" -f $resolveB.Identity, $serverB, $resolveB.IdentityType)
+
+# If either unresolved, exit (no fallbacks)
+if ($resolveA.IdentityType -eq 'Unresolved' -or $resolveB.IdentityType -eq 'Unresolved') {
+    Write-Error "One or both groups could not be resolved conclusively. Provide a domain/server, DN, or GUID/SID for the unresolved group(s). Exiting."
+    exit 4
 }
 
-# Fetch members
+# Fetch member lists
 $membersA = Get-Members -ResolvedIdentity $resolveA.Identity -Server $resolveA.Server -IsDistinguishedName:($resolveA.IdentityType -match 'DN|ResolvedDN')
 $membersB = Get-Members -ResolvedIdentity $resolveB.Identity -Server $resolveB.Server -IsDistinguishedName:($resolveB.IdentityType -match 'DN|ResolvedDN')
 
+# If both empty, error and exit
 if (($membersA.Count -eq 0) -and ($membersB.Count -eq 0)) {
     Write-Error "No members returned for either group. Verify connectivity, credentials, and helper parameter expectations."
     exit 3
 }
 
-# Normalize KeyField and compute diffs
+# Normalize KeyField and produce maps (drop members that have no useful fields for display)
 function NormalizeKey {
     param($obj)
     $v = $null
@@ -277,41 +254,75 @@ function NormalizeKey {
 
 $mapA = @{}
 foreach ($m in ,$membersA) {
+    # skip completely-empty member objects (so output doesn't show giant blank rows)
+    if (-not (HasAnyField $m $Fields)) { continue }
     $k = NormalizeKey $m
     if ($k) { $keyn = $k.ToUpper() } else { $keyn = [Guid]::NewGuid().ToString() }
     $mapA[$keyn] = $m
 }
 $mapB = @{}
 foreach ($m in ,$membersB) {
+    if (-not (HasAnyField $m $Fields)) { continue }
     $k = NormalizeKey $m
     if ($k) { $keyn = $k.ToUpper() } else { $keyn = [Guid]::NewGuid().ToString() }
     $mapB[$keyn] = $m
 }
 
+# Compare
 $refKeys = $mapA.Keys | Sort-Object
 $diffKeys = $mapB.Keys | Sort-Object
-
 $cmp = Compare-Object -ReferenceObject $refKeys -DifferenceObject $diffKeys -PassThru
 
 $inA_NotInB = @()
 $inB_NotInA = @()
-
 foreach ($k in $cmp) {
     if ($mapA.ContainsKey($k) -and -not $mapB.ContainsKey($k)) { $inA_NotInB += $mapA[$k] }
     elseif ($mapB.ContainsKey($k) -and -not $mapA.ContainsKey($k)) { $inB_NotInA += $mapB[$k] }
 }
 
-# Output
+# Output with explicit identical-members message
 Write-Host "--------------------------------------------------"
-Write-Host ("Members in '{0}' (resolved: {1}) but NOT in '{2}' (resolved: {3}): ({4})" -f $GroupA, $resolveA.Identity, $GroupB, $resolveB.Identity, $inA_NotInB.Count)
-if ($inA_NotInB.Count -gt 0) { $inA_NotInB | Select-Object -Property $Fields | Format-Table -AutoSize } else { Write-Host "  <none>" }
+
+if (($inA_NotInB.Count -eq 0) -and ($inB_NotInA.Count -eq 0)) {
+    Write-Host ("Groups '{0}' and '{1}' have identical membership." -f $GroupA, $GroupB)
+    Write-Host "No differences found."
+    Write-Host "--------------------------------------------------"
+    # Export CSV if requested (create empty files with headers)
+    if ($CsvOut) {
+        $dir = Split-Path -Parent $CsvOut
+        if (-not [string]::IsNullOrEmpty($dir) -and -not (Test-Path $dir)) { New-Item -Path $dir -ItemType Directory -Force | Out-Null }
+        $fileA = "$CsvOut.A-not-in-B.csv"
+        $fileB = "$CsvOut.B-not-in-A.csv"
+        # export empty CSV with headers
+        $empty = @()
+        $empty | Select-Object -Property $Fields | Export-Csv -Path $fileA -NoTypeInformation -Encoding UTF8
+        $empty | Select-Object -Property $Fields | Export-Csv -Path $fileB -NoTypeInformation -Encoding UTF8
+        Write-Host "CSV exported (empty differences):"
+        Write-Host "  $fileA"
+        Write-Host "  $fileB"
+    }
+    exit 0
+}
+
+# Show differences
+Write-Host ("Members in '{0}' but NOT in '{1}': ({2})" -f $GroupA, $GroupB, $inA_NotInB.Count)
+if ($inA_NotInB.Count -gt 0) {
+    $inA_NotInB | Select-Object -Property $Fields | Format-Table -AutoSize
+} else {
+    Write-Host "  <none>"
+}
 
 Write-Host ""
-Write-Host ("Members in '{0}' (resolved: {1}) but NOT in '{2}' (resolved: {3}): ({4})" -f $GroupB, $resolveB.Identity, $GroupA, $resolveA.Identity, $inB_NotInA.Count)
-if ($inB_NotInA.Count -gt 0) { $inB_NotInA | Select-Object -Property $Fields | Format-Table -AutoSize } else { Write-Host "  <none>" }
+Write-Host ("Members in '{0}' but NOT in '{1}': ({2})" -f $GroupB, $GroupA, $inB_NotInA.Count)
+if ($inB_NotInA.Count -gt 0) {
+    $inB_NotInA | Select-Object -Property $Fields | Format-Table -AutoSize
+} else {
+    Write-Host "  <none>"
+}
+
 Write-Host "--------------------------------------------------"
 
-# CSV export
+# CSV export for actual diffs
 if ($CsvOut) {
     $dir = Split-Path -Parent $CsvOut
     if (-not [string]::IsNullOrEmpty($dir) -and -not (Test-Path $dir)) { New-Item -Path $dir -ItemType Directory -Force | Out-Null }
