@@ -43,8 +43,7 @@ param(
 
     [string]$DomainA,
     [string]$DomainB,
-    [Alias('domain')]
-    [string]$Domain,
+    [string]$Domain,                # removed Alias to avoid name/alias conflict
 
     [switch]$UseGlobalCatalog,
 
@@ -70,7 +69,10 @@ if (-not (Test-Path $helper)) {
 
 function Write-DebugLine {
     param($Message)
-    Write-Verbose $Message
+    # Only write when -Verbose is passed
+    if ($PSBoundParameters.ContainsKey('Verbose') -or $VerbosePreference -ne 'SilentlyContinue') {
+        Write-Verbose $Message
+    }
 }
 
 # Resolve a group string to an identity and (optionally) a server to target.
