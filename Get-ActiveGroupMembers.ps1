@@ -109,7 +109,7 @@ function Get-DomainFromDistinguishedName {
         }
     }
 
-    if ($dcParts.Count -gt 0) {
+    if (@($dcParts).Count -gt 0) {
         return ($dcParts -join '.')
     }
 
@@ -121,17 +121,23 @@ function Get-FallbackDomainList {
         [Parameter(Mandatory=$false)]
         [AllowNull()]
         [AllowEmptyCollection()]
-        [string[]]$ExplicitDomains
+        [object]$ExplicitDomains
     )
 
-    if ($ExplicitDomains -and $ExplicitDomains.Count -gt 0) {
-        return $ExplicitDomains
+    # Treat scalar or array consistently
+    $explicitList = @()
+    if ($null -ne $ExplicitDomains) {
+        $explicitList = @($ExplicitDomains) | Where-Object { $_ -and ([string]$_).Trim().Length -gt 0 } | ForEach-Object { ([string]$_).Trim() }
+    }
+
+    if (@($explicitList).Count -gt 0) {
+        return [string[]]$explicitList
     }
 
     try {
         $forest = Get-ADForest -ErrorAction Stop
-        if ($forest -and $forest.Domains -and $forest.Domains.Count -gt 0) {
-            return [string[]]$forest.Domains
+        if ($forest -and $forest.Domains -and @($forest.Domains).Count -gt 0) {
+            return [string[]]@($forest.Domains)
         }
     } catch {
         # ignore
@@ -149,7 +155,7 @@ function Get-ADUserCrossDomain {
         [string[]]$Properties,
 
         [Parameter(Mandatory=$true)]
-        [string[]]$FallbackDomains
+        [object]$FallbackDomains
     )
 
     $tryList = New-Object System.Collections.Generic.List[string]
@@ -157,10 +163,14 @@ function Get-ADUserCrossDomain {
     $dnDomain = Get-DomainFromDistinguishedName -DistinguishedName $DistinguishedName
     if ($dnDomain) { [void]$tryList.Add($dnDomain) }
 
-    if ($FallbackDomains) {
-        foreach ($d in $FallbackDomains) {
-            if (-not $tryList.Contains($d)) { [void]$tryList.Add($d) }
-        }
+    $fallbackList = @()
+    if ($null -ne $FallbackDomains) { $fallbackList = @($FallbackDomains) }
+
+    foreach ($d in $fallbackList) {
+        if (-not $d) { continue }
+        $ds = ([string]$d).Trim()
+        if (-not $ds) { continue }
+        if (-not $tryList.Contains($ds)) { [void]$tryList.Add($ds) }
     }
 
     if ($tryList.Count -eq 0) {
@@ -185,16 +195,23 @@ function Resolve-ADGroupCrossDomain {
         [string]$Identity,
 
         [Parameter(Mandatory=$true)]
-        [string[]]$DomainList
+        [object]$DomainList
     )
 
-    if (-not $DomainList -or $DomainList.Count -eq 0) {
+    $dl = @()
+    if ($null -ne $DomainList) { $dl = @($DomainList) }
+
+    if (@($dl).Count -eq 0) {
         return Get-ADGroup -Identity $Identity -ErrorAction Stop
     }
 
-    foreach ($d in $DomainList) {
+    foreach ($d in $dl) {
+        if (-not $d) { continue }
+        $ds = ([string]$d).Trim()
+        if (-not $ds) { continue }
+
         try {
-            return Get-ADGroup -Server $d -Identity $Identity -ErrorAction Stop
+            return Get-ADGroup -Server $ds -Identity $Identity -ErrorAction Stop
         } catch {
             continue
         }
@@ -209,7 +226,7 @@ function Get-ADGroupMembersCrossDomain {
         [Microsoft.ActiveDirectory.Management.ADGroup]$Group,
 
         [Parameter(Mandatory=$true)]
-        [string[]]$DomainList
+        [object]$DomainList
     )
 
     $groupDomain = $null
@@ -217,10 +234,17 @@ function Get-ADGroupMembersCrossDomain {
         $groupDomain = Get-DomainFromDistinguishedName -DistinguishedName $Group.DistinguishedName
     }
 
+    $dl = @()
+    if ($null -ne $DomainList) { $dl = @($DomainList) }
+
     $tryList = New-Object System.Collections.Generic.List[string]
     if ($groupDomain) { [void]$tryList.Add($groupDomain) }
-    foreach ($d in $DomainList) {
-        if (-not $tryList.Contains($d)) { [void]$tryList.Add($d) }
+
+    foreach ($d in $dl) {
+        if (-not $d) { continue }
+        $ds = ([string]$d).Trim()
+        if (-not $ds) { continue }
+        if (-not $tryList.Contains($ds)) { [void]$tryList.Add($ds) }
     }
 
     if ($tryList.Count -eq 0) {
@@ -293,7 +317,6 @@ function Convert-ADValueToDisplayString {
         return ("BINARY ({0} bytes)" -f $Value.Length)
     }
 
-    # Treat ADPropertyValueCollection and any other IEnumerable (except string) as multi-valued.
     if (($Value -is [System.Collections.IEnumerable]) -and -not ($Value -is [string])) {
         $items = @()
         foreach ($item in $Value) {
@@ -332,7 +355,7 @@ function Build-FieldPlan {
 
     $explicit = Normalize-UniqueNonEmpty -Values $ExplicitFields
 
-    if ($explicit.Count -gt 0) {
+    if (@($explicit).Count -gt 0) {
         foreach ($f in $explicit) {
             switch -Regex ($f) {
                 '^(?i)samaccountname$' { & $addColumn 'SamAccountName' 'SamAccountName' }
@@ -389,7 +412,6 @@ function Test-UserIsActive {
     )
 
     if (-not $IncludeDisabled) {
-        # Enabled can be $null for some edge cases; treat $false explicitly as disabled.
         if ($UserObject.PSObject.Properties.Match('Enabled').Count -gt 0) {
             if ($UserObject.Enabled -eq $false) { return $false }
         }
@@ -419,7 +441,7 @@ try {
 }
 
 if (-not $group) {
-    if ($fallbackDomains -and $fallbackDomains.Count -gt 0) {
+    if ($fallbackDomains -and @($fallbackDomains).Count -gt 0) {
         throw "Failed to resolve group '$GroupName' using domains: $($fallbackDomains -join ', ')"
     }
     throw "Failed to resolve group '$GroupName' in the current domain context, and domain discovery was not available. Specify -Domains for cross-domain resolution."
@@ -444,16 +466,16 @@ foreach ($rf in $requiredForFilter) {
 # Determine whether structured output is needed
 $needsStructured = $false
 if ($fieldPlan.UsesExplicit) {
-    if ($outProps.Count -gt 1) { $needsStructured = $true }
+    if (@($outProps).Count -gt 1) { $needsStructured = $true }
 } else {
-    if ($Name -or $Email -or ($Attributes.Count -gt 0)) { $needsStructured = $true }
+    if ($Name -or $Email -or (@($Attributes).Count -gt 0)) { $needsStructured = $true }
 }
 if ($Csv -or $Tsv) { $needsStructured = $true }
 
 # If still not structured, output usernames only (but still apply active filters)
 if (-not $needsStructured) {
     $namesOnly = New-Object System.Collections.Generic.List[string]
-    foreach ($m in $members) {
+    foreach ($m in @($members)) {
         if ($m.objectClass -ne 'user') { continue }
         if (-not $m.DistinguishedName) { continue }
 
@@ -473,7 +495,7 @@ if (-not $needsStructured) {
 # Structured output: build rows with normalized display values, apply active filters
 $results = New-Object System.Collections.Generic.List[object]
 
-foreach ($m in $members) {
+foreach ($m in @($members)) {
     if ($m.objectClass -ne 'user') { continue }
     if (-not $m.DistinguishedName) { continue }
 
