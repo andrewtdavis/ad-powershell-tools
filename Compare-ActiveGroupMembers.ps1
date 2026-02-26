@@ -51,7 +51,7 @@ function Write-DebugLine {
     }
 }
 
-# Resolve a group string to an identity and server (same Resolve-Group as before)
+# Resolve a group string to an identity and server
 function Resolve-Group {
     param(
         [string]$GroupInput,
@@ -83,6 +83,7 @@ function Resolve-Group {
         return @{ Identity = $GroupInput; Server = $PreferServer; IdentityType = 'Raw' }
     }
 
+    # Try AD cmdlets if available
     $adAvailable = $false
     try {
         if (Get-Command -Name Get-ADGroup -ErrorAction Stop) { $adAvailable = $true }
@@ -146,19 +147,19 @@ function Resolve-Group {
     return @{ Identity = $GroupInput; Server = $PreferServer; IdentityType = 'Unresolved' }
 }
 
-# Core: call helper either as function or as script file with splatting
+# Invoke helper as function or script file
 function Invoke-Helper {
     param(
         [hashtable]$SplatArgs
     )
 
-    # Clean empty entries (avoid passing $null members)
+    # Clean empty entries
     $clean = @{}
     foreach ($k in $SplatArgs.Keys) {
         if ($SplatArgs[$k] -ne $null) { $clean[$k] = $SplatArgs[$k] }
     }
 
-    # If a function named Get-ActiveGroupMembers exists, call it; otherwise call the script file path
+    # Detect function
     $isFunction = $false
     try {
         $cmd = Get-Command -Name Get-ActiveGroupMembers -ErrorAction SilentlyContinue
@@ -169,15 +170,12 @@ function Invoke-Helper {
         Write-DebugLine "Invoking function Get-ActiveGroupMembers with splatted args."
         return & Get-ActiveGroupMembers @clean
     } else {
-        # Call script by full path. Use -File invocation to avoid param name auto-resolution issues.
-        # PowerShell does not accept splatting on script with & when the script is not a function; instead run powershell -File is not desired.
-        # But calling & $helperPath @clean works in practice - ensure $helperPath is full path.
         Write-DebugLine "Invoking script file $helperPath with splatted args."
         return & $helperPath @clean
     }
 }
 
-# Get members wrapper that prepares the correct parameter name for helper
+# Build and try several splat forms, then fallback to positional call
 function Get-Members {
     param(
         [string]$ResolvedIdentity,
@@ -185,46 +183,36 @@ function Get-Members {
         [switch]$IsDistinguishedName
     )
 
-    # Build candidate splat with common param names - helper may accept any of these:
+    # Candidate splats with common parameter names
     $candidateSplats = @()
 
-    # 1) GroupName (most common in earlier helper)
     $candidateSplats += @{ GroupName = $ResolvedIdentity; Fields = $Fields; Server = $Server }
-
-    # 2) Identity
     $candidateSplats += @{ Identity = $ResolvedIdentity; Fields = $Fields; Server = $Server }
-
-    # 3) DistinguishedName (if DN)
     $candidateSplats += @{ DistinguishedName = $ResolvedIdentity; Fields = $Fields; Server = $Server }
 
-    # 4) Fallback raw positional (some scripts expect first positional param)
-    $candidateSplats += @{ $null = $ResolvedIdentity }  # not used for splatting - will not work, kept for illustration
-
-    # Try each candidate splat until one returns non-empty without prompting
-    foreach ($s in $candidateSplats) {
-        # Skip any hashtable with null key entries
-        $splat = @{}
-        foreach ($k in $s.Keys) {
-            if ($k -eq $null) { continue }
-            if ($s[$k] -ne $null) { $splat[$k] = $s[$k] }
-        }
-
-        # Forward switches if present and helper supports them (Invoke-Helper will pass them; helper may ignore unknown params)
+    foreach ($splat in $candidateSplats) {
+        # Forward switches if present
         if ($IncludeDisabled) { $splat['IncludeDisabled'] = $true }
         if ($IncludeExpired) { $splat['IncludeExpired'] = $true }
 
-        Write-DebugLine ("Trying helper with parameters: {0}" -f ($splat | Out-String))
-
-        # Invoke helper
-        $result = Invoke-Helper -SplatArgs $splat 2>&1
-
-        # If result is empty array or $null, try next; if it returned an ErrorRecord or string prompting, handle carefully
-        if ($result -is [System.Management.Automation.ErrorRecord]) {
-            Write-DebugLine "Helper returned an ErrorRecord; trying next parameter form."
-            continue
+        # Remove null values
+        $clean = @{}
+        foreach ($k in $splat.Keys) {
+            if ($splat[$k] -ne $null) { $clean[$k] = $splat[$k] }
         }
 
-        # If result contains a prompt text like 'Supply values for the following parameters', treat as failure
+        Write-DebugLine ("Trying helper with parameters: {0}" -f ($clean | Out-String))
+
+        try {
+            $result = Invoke-Helper -SplatArgs $clean 2>&1
+        } catch {
+            Write-DebugLine "Invoke-Helper threw: $($_.Exception.Message)"
+            $result = $null
+        }
+
+        if ($result -eq $null) { continue }
+
+        # Convert to string to detect prompt text
         $asString = $null
         try { $asString = $result | Out-String } catch { $asString = $null }
 
@@ -233,22 +221,22 @@ function Get-Members {
             continue
         }
 
-        # Successful-ish result
+        # Otherwise return whatever was returned (could be empty array)
         return ,$result
     }
 
-    # Last attempt: call the script passing the identity positionally using & $helperPath - will still prompt if helper needs named params
+    # Final fallback: call script with positional arg (may still prompt if helper requires named params)
     try {
-        Write-DebugLine "Last attempt: calling helper script path with positional argument."
+        Write-DebugLine "Final fallback: calling script path with positional identity."
         $posResult = & $helperPath $ResolvedIdentity
         return ,$posResult
     } catch {
-        Write-Warning "Final attempt failed: $($_.Exception.Message)"
+        Write-Warning "Final fallback failed: $($_.Exception.Message)"
         return @()
     }
 }
 
-# Compute prefer-server values
+# Compute prefer-server
 $preferA = $null
 if ($DomainA) { $preferA = $DomainA } elseif ($Domain) { $preferA = $Domain }
 
@@ -266,7 +254,7 @@ if ($AutoResolve -and ($resolveA.IdentityType -eq 'Unresolved' -or $resolveB.Ide
     Write-Warning "One or both groups could not be conclusively resolved. The script will still attempt to call the helper with the best available values."
 }
 
-# Fetch members using robust caller
+# Fetch members
 $membersA = Get-Members -ResolvedIdentity $resolveA.Identity -Server $resolveA.Server -IsDistinguishedName:($resolveA.IdentityType -match 'DN|ResolvedDN')
 $membersB = Get-Members -ResolvedIdentity $resolveB.Identity -Server $resolveB.Server -IsDistinguishedName:($resolveB.IdentityType -match 'DN|ResolvedDN')
 
@@ -275,7 +263,7 @@ if (($membersA.Count -eq 0) -and ($membersB.Count -eq 0)) {
     exit 3
 }
 
-# Normalize and diff (same approach as before)
+# Normalize KeyField and compute diffs
 function NormalizeKey {
     param($obj)
     $v = $null
@@ -290,13 +278,13 @@ function NormalizeKey {
 $mapA = @{}
 foreach ($m in ,$membersA) {
     $k = NormalizeKey $m
-    $keyn = if ($k) { $k.ToUpper() } else { [Guid]::NewGuid().ToString() }
+    if ($k) { $keyn = $k.ToUpper() } else { $keyn = [Guid]::NewGuid().ToString() }
     $mapA[$keyn] = $m
 }
 $mapB = @{}
 foreach ($m in ,$membersB) {
     $k = NormalizeKey $m
-    $keyn = if ($k) { $k.ToUpper() } else { [Guid]::NewGuid().ToString() }
+    if ($k) { $keyn = $k.ToUpper() } else { $keyn = [Guid]::NewGuid().ToString() }
     $mapB[$keyn] = $m
 }
 
@@ -313,7 +301,7 @@ foreach ($k in $cmp) {
     elseif ($mapB.ContainsKey($k) -and -not $mapA.ContainsKey($k)) { $inB_NotInA += $mapB[$k] }
 }
 
-# Output and CSV (unchanged)
+# Output
 Write-Host "--------------------------------------------------"
 Write-Host ("Members in '{0}' (resolved: {1}) but NOT in '{2}' (resolved: {3}): ({4})" -f $GroupA, $resolveA.Identity, $GroupB, $resolveB.Identity, $inA_NotInB.Count)
 if ($inA_NotInB.Count -gt 0) { $inA_NotInB | Select-Object -Property $Fields | Format-Table -AutoSize } else { Write-Host "  <none>" }
@@ -323,6 +311,7 @@ Write-Host ("Members in '{0}' (resolved: {1}) but NOT in '{2}' (resolved: {3}): 
 if ($inB_NotInA.Count -gt 0) { $inB_NotInA | Select-Object -Property $Fields | Format-Table -AutoSize } else { Write-Host "  <none>" }
 Write-Host "--------------------------------------------------"
 
+# CSV export
 if ($CsvOut) {
     $dir = Split-Path -Parent $CsvOut
     if (-not [string]::IsNullOrEmpty($dir) -and -not (Test-Path $dir)) { New-Item -Path $dir -ItemType Directory -Force | Out-Null }
