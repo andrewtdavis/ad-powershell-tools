@@ -3,7 +3,7 @@
   Compare members of two AD groups across domains with automatic domain inference.
 
 .DESCRIPTION
-  - Dot-sources / invokes Get-ActiveGroupMembers.ps1 (helper must be in same folder).
+  - Invokes Get-ActiveGroupMembers.ps1 (helper must be in same folder).
   - Attempts to infer domain/server for each group; supports -DomainA/-DomainB or -Domain (single).
   - Exits if either group cannot be resolved (no fallbacks).
   - Filters out completely-empty member objects before formatting output.
@@ -11,7 +11,6 @@
 
 .NOTES
   - PowerShell 5.1 compatible.
-  - If the helper still prompts, paste the helper's param block and the script will be adjusted to its exact parameter names.
 #>
 
 [CmdletBinding()]
@@ -71,7 +70,6 @@ function Resolve-Group {
         return @{ Identity = $GroupInput; Server = $null; IdentityType = 'UPN' }
     }
 
-    # If AutoResolve disabled, pass raw plus prefer-server if present
     if (-not $AutoResolve) {
         return @{ Identity = $GroupInput; Server = $PreferServer; IdentityType = 'Raw' }
     }
@@ -111,7 +109,6 @@ function Resolve-Group {
             } catch { Write-DebugLine "GC lookup failed: $($_.Exception.Message)" }
         }
 
-        # Try candidate servers
         $candidates = @()
         if ($PreferServer) { $candidates += $PreferServer }
         if ($Domain) { $candidates += $Domain }
@@ -180,7 +177,6 @@ function Get-Members {
             continue
         }
 
-        # Return result (could be empty collection)
         return ,$result
     }
 
@@ -252,9 +248,9 @@ function NormalizeKey {
     return [string]$v
 }
 
+# Build maps, skipping completely-empty member objects
 $mapA = @{}
 foreach ($m in ,$membersA) {
-    # skip completely-empty member objects (so output doesn't show giant blank rows)
     if (-not (HasAnyField $m $Fields)) { continue }
     $k = NormalizeKey $m
     if ($k) { $keyn = $k.ToUpper() } else { $keyn = [Guid]::NewGuid().ToString() }
@@ -268,9 +264,32 @@ foreach ($m in ,$membersB) {
     $mapB[$keyn] = $m
 }
 
+# --- SAFETY: If both maps are empty after filtering, treat as identical and exit ---
+if (($mapA.Count -eq 0) -and ($mapB.Count -eq 0)) {
+    Write-Host "--------------------------------------------------"
+    Write-Host ("Groups '{0}' and '{1}' have identical membership." -f $GroupA, $GroupB)
+    Write-Host "No differences found."
+    Write-Host "--------------------------------------------------"
+    if ($CsvOut) {
+        $dir = Split-Path -Parent $CsvOut
+        if (-not [string]::IsNullOrEmpty($dir) -and -not (Test-Path $dir)) { New-Item -Path $dir -ItemType Directory -Force | Out-Null }
+        $fileA = "$CsvOut.A-not-in-B.csv"
+        $fileB = "$CsvOut.B-not-in-A.csv"
+        $empty = @()
+        $empty | Select-Object -Property $Fields | Export-Csv -Path $fileA -NoTypeInformation -Encoding UTF8
+        $empty | Select-Object -Property $Fields | Export-Csv -Path $fileB -NoTypeInformation -Encoding UTF8
+        Write-Host "CSV exported (empty differences):"
+        Write-Host "  $fileA"
+        Write-Host "  $fileB"
+    }
+    exit 0
+}
+
+# Safe key extraction (wrap in array to guarantee non-null)
+$refKeys = @($mapA.Keys)
+$diffKeys = @($mapB.Keys)
+
 # Compare
-$refKeys = $mapA.Keys | Sort-Object
-$diffKeys = $mapB.Keys | Sort-Object
 $cmp = Compare-Object -ReferenceObject $refKeys -DifferenceObject $diffKeys -PassThru
 
 $inA_NotInB = @()
@@ -287,13 +306,11 @@ if (($inA_NotInB.Count -eq 0) -and ($inB_NotInA.Count -eq 0)) {
     Write-Host ("Groups '{0}' and '{1}' have identical membership." -f $GroupA, $GroupB)
     Write-Host "No differences found."
     Write-Host "--------------------------------------------------"
-    # Export CSV if requested (create empty files with headers)
     if ($CsvOut) {
         $dir = Split-Path -Parent $CsvOut
         if (-not [string]::IsNullOrEmpty($dir) -and -not (Test-Path $dir)) { New-Item -Path $dir -ItemType Directory -Force | Out-Null }
         $fileA = "$CsvOut.A-not-in-B.csv"
         $fileB = "$CsvOut.B-not-in-A.csv"
-        # export empty CSV with headers
         $empty = @()
         $empty | Select-Object -Property $Fields | Export-Csv -Path $fileA -NoTypeInformation -Encoding UTF8
         $empty | Select-Object -Property $Fields | Export-Csv -Path $fileB -NoTypeInformation -Encoding UTF8
