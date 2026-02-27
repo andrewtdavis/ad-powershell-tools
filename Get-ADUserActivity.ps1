@@ -1,7 +1,7 @@
- <#
+<#
 .INFO
   Synopsis:
-    Query Active Directory user activity and export selected fields (CSV/TSV), optionally filtering by last-logon staleness.
+    Report AD user activity (last logon and modified), optionally filtered by a staleness cutoff, with CSV or TSV export.
 
   Description:
     Queries Active Directory users within a domain or an OU search base and outputs requested fields.
@@ -17,14 +17,15 @@
 
     Account filtering:
       - By default, disabled and expired accounts are excluded.
-      - Use -IncludeDisabled and/or -IncludeExpired to include them.
+      - Use -IncludeDisabled and or -IncludeExpired to include them.
 
     Field selection:
       - -Fields defines output columns exactly. No implicit columns are added.
-      - Computed aliases supported:
+      - Computed aliases:
           * LastLogon
           * Modified
           * AccountState (computed from Enabled + AccountExpirationDate)
+          * OU and OrganizationalUnit (computed from DistinguishedName by removing the leading RDN)
       - Common alias:
           * Email (maps to mail)
       - Any other token is treated as an AD attribute name (example: mail, department, employeeID).
@@ -32,17 +33,17 @@
     Output:
       - Default: objects
       - -Csv or -Tsv: outputs delimited text
-      - -OutFile: writes the chosen output format to a file (still outputs to stdout)
+      - -OutFile: writes the chosen output format to a file (stdout output is still produced)
 
   Parameters:
     -Domain
       Domain DNS name or domain controller to query.
 
     -SearchBase
-      Distinguished name (DN) of an OU/container used as query root (subtree).
+      Distinguished name (DN) of an OU or container used as query root (subtree).
 
     -Domains
-      One or more domains/domain controllers used as fallback targets for query execution.
+      One or more domains or domain controllers used as fallback targets for query execution.
 
     -Cutoff
       Staleness cutoff in compact form: <number><unit>
@@ -64,11 +65,11 @@
       Include expired accounts (AccountExpirationDate in the past).
 
     -Fields
-      Output columns / lookup fields. No implicit columns are added.
+      Output columns or lookup fields. No implicit columns are added.
       Accepted forms:
-        -Fields mail,LastLogon,Modified,AccountState
-        -Fields "mail,LastLogon,Modified,AccountState"
-        -Fields mail LastLogon Modified AccountState
+        -Fields mail,LastLogon,Modified,AccountState,OU
+        -Fields "mail,LastLogon,Modified,AccountState,OU"
+        -Fields mail LastLogon Modified AccountState OU
 
     -Csv / -Tsv
       Output as CSV or TSV.
@@ -77,8 +78,7 @@
       Output file path.
 
   Examples:
-    .\Get-ADUserActivity.ps1 -SearchBase "OU=Users,DC=example,DC=com" -Cutoff 6m -Fields mail,LastLogon,Modified,AccountState -Tsv -OutFile .\users.tsv
-    .\Get-ADUserActivity.ps1 -Domain example.com -Fields SamAccountName,mail,LastLogon -Csv -OutFile .\users.csv
+    .\Get-ADUserActivity.ps1 -SearchBase "OU=Users,DC=example,DC=com" -Cutoff 6m -Fields UserPrincipalName,mail,LastLogon,Modified,AccountState,OU -Tsv -OutFile .\users.tsv
 #>
 
 [CmdletBinding(DefaultParameterSetName = 'ByDomain')]
@@ -156,7 +156,6 @@ function Resolve-FieldList {
     if ($null -eq $RawFields) { return @() }
 
     $tokens = @()
-
     foreach ($item in @($RawFields)) {
         if ($null -eq $item) { continue }
 
@@ -217,6 +216,17 @@ function Get-ComputedLastLogon {
     $llt = $User.lastLogonTimestamp
     if ($null -eq $llt -or $llt -eq 0) { return $null }
     return [DateTime]::FromFileTime([Int64]$llt)
+}
+
+function Get-ParentDn {
+    param([AllowNull()][string]$DistinguishedName)
+
+    if (-not $DistinguishedName) { return $null }
+
+    $parts = $DistinguishedName -split ',', 2
+    if ($parts.Count -lt 2) { return $null }
+
+    return $parts[1]
 }
 
 function Test-UserIsActive {
@@ -282,11 +292,25 @@ function Build-PropertyRequestList {
 
     foreach ($c in @($OutputColumns)) {
         switch -Regex ($c) {
-            '^(?i)LastLogon$'    { if ($props -notcontains 'lastLogonTimestamp') { $props += 'lastLogonTimestamp' } }
-            '^(?i)Modified$'     { if ($props -notcontains 'whenChanged') { $props += 'whenChanged' } }
-            '^(?i)AccountState$' { if ($props -notcontains 'Enabled') { $props += 'Enabled' }; if ($props -notcontains 'AccountExpirationDate') { $props += 'AccountExpirationDate' } }
-            '^(?i)Email$'        { if ($props -notcontains 'mail') { $props += 'mail' } }
-            default              { if ($props -notcontains $c) { $props += $c } }
+            '^(?i)LastLogon$' {
+                if ($props -notcontains 'lastLogonTimestamp') { $props += 'lastLogonTimestamp' }
+            }
+            '^(?i)Modified$' {
+                if ($props -notcontains 'whenChanged') { $props += 'whenChanged' }
+            }
+            '^(?i)AccountState$' {
+                if ($props -notcontains 'Enabled') { $props += 'Enabled' }
+                if ($props -notcontains 'AccountExpirationDate') { $props += 'AccountExpirationDate' }
+            }
+            '^(?i)Email$' {
+                if ($props -notcontains 'mail') { $props += 'mail' }
+            }
+            '^(?i)(OU|OrganizationalUnit)$' {
+                if ($props -notcontains 'DistinguishedName') { $props += 'DistinguishedName' }
+            }
+            default {
+                if ($props -notcontains $c) { $props += $c }
+            }
         }
     }
 
@@ -322,9 +346,7 @@ function ConvertTo-Tsv {
         param([object]$v)
         if ($null -eq $v) { return '' }
         $s = [string]$v
-        if ($s -match '[\t\r\n"]') {
-            return '"' + ($s -replace '"', '""') + '"'
-        }
+        if ($s -match '[\t\r\n"]') { return '"' + ($s -replace '"', '""') + '"' }
         return $s
     }
 
@@ -367,7 +389,6 @@ if (@($tryList).Count -eq 0) {
 $resolvedFields = Resolve-FieldList -RawFields $Fields
 
 if (@($resolvedFields).Count -eq 0) {
-    # Default view only when -Fields not provided
     $resolvedFields = @(
         'SamAccountName','Name','mail','Enabled','AccountState',
         'AccountExpirationDate','LastLogon','Modified','DistinguishedName'
@@ -379,8 +400,6 @@ $cutoffDate = $null
 if ($Cutoff -and $Cutoff.Trim()) {
     $cutoffDate = $now.Add(-(Convert-CutoffToTimeSpan -Value $Cutoff))
 }
-
-Write-Verbose ("Resolved Fields: {0}" -f ($resolvedFields -join ', '))
 
 $needsCutoff = [bool]($cutoffDate -ne $null)
 $needsFiltering = $true
@@ -429,11 +448,30 @@ foreach ($u in @($users)) {
     $row = [ordered]@{}
     foreach ($col in @($resolvedFields)) {
         switch -Regex ($col) {
-            '^(?i)LastLogon$'    { $row[$col] = Get-ComputedLastLogon -User $u; break }
-            '^(?i)Modified$'     { $row[$col] = $u.whenChanged; break }
-            '^(?i)AccountState$' { $row[$col] = Get-AccountState -User $u -Now $now; break }
-            '^(?i)Email$'        { $row[$col] = $u.mail; break }
-            default              { $row[$col] = $u.$col; break }
+            '^(?i)LastLogon$' {
+                $row[$col] = Get-ComputedLastLogon -User $u
+                break
+            }
+            '^(?i)Modified$' {
+                $row[$col] = $u.whenChanged
+                break
+            }
+            '^(?i)AccountState$' {
+                $row[$col] = Get-AccountState -User $u -Now $now
+                break
+            }
+            '^(?i)Email$' {
+                $row[$col] = $u.mail
+                break
+            }
+            '^(?i)(OU|OrganizationalUnit)$' {
+                $row[$col] = Get-ParentDn -DistinguishedName $u.DistinguishedName
+                break
+            }
+            default {
+                $row[$col] = $u.$col
+                break
+            }
         }
     }
 

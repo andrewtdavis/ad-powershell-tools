@@ -1,77 +1,102 @@
 ﻿<#
 .INFO
   Synopsis:
-    Enumerate AD group members across domains/forests and output selected user fields.
+    Report AD user activity (last logon and modified), optionally filtered by a staleness cutoff, with CSV or TSV export.
 
   Description:
-    Retrieves group members for the specified group and resolves each member to an AD user.
-    Cross-domain lookups are supported by probing the member's DN-derived DNS domain first,
-    then falling back to a domain list.
+    Queries Active Directory users within a domain or an OU search base and outputs requested fields.
 
-    Field selection:
-      - If -Fields is provided, it defines the output columns and which AD attributes are requested.
-        Special aliases:
-          * Email -> AD attribute mail, output column name Email
-      - If -Fields is not provided, output is built from:
-          SamAccountName (always), optional -Name, optional -Email, plus -Attributes.
+    Activity fields:
+      - LastLogon is computed from lastLogonTimestamp (replicated, may lag).
+      - Modified is read from whenChanged.
+
+    Cutoff behavior:
+      - When -Cutoff is specified, results include users whose LastLogon is:
+          * missing (never or not recorded), unless -ExcludeNeverLoggedIn is set
+          * older than (Now - Cutoff)
 
     Account filtering:
-      - By default, disabled users and expired users are excluded:
-          * Enabled -eq $false
-          * AccountExpirationDate is set and < now
-      - Use -IncludeDisabled and/or -IncludeExpired to override.
+      - By default, disabled and expired accounts are excluded.
+      - Use -IncludeDisabled and or -IncludeExpired to include them.
+
+    Field selection:
+      - -Fields defines output columns exactly. No implicit columns are added.
+      - Computed aliases:
+          * LastLogon
+          * Modified
+          * AccountState (computed from Enabled + AccountExpirationDate)
+          * OU and OrganizationalUnit (computed from DistinguishedName by removing the leading RDN)
+      - Common alias:
+          * Email (maps to mail)
+      - Any other token is treated as an AD attribute name (example: mail, department, employeeID).
+
+    Output:
+      - Default: objects
+      - -Csv or -Tsv: outputs delimited text
+      - -OutFile: writes the chosen output format to a file (stdout output is still produced)
 
   Parameters:
-    -GroupName
-      Group name (sAMAccountName, CN, or distinguished name).
+    -Domain
+      Domain DNS name or domain controller to query.
+
+    -SearchBase
+      Distinguished name (DN) of an OU or container used as query root (subtree).
 
     -Domains
-      One or more domains or domain controllers to query.
+      One or more domains or domain controllers used as fallback targets for query execution.
 
-    -Fields
-      Optional. Explicit output columns / lookup fields.
-      Examples: SamAccountName,Name,Email,uidNumber,employeeID,uid
+    -Cutoff
+      Staleness cutoff in compact form: <number><unit>
+        Units:
+          h = hours
+          d = days
+          w = weeks
+          m = months (30 days)
+          y = years (365 days)
+      Examples: 24h, 30d, 6m, 1y
 
-    -Name / -Email / -Attributes
-      Legacy field selection.
+    -ExcludeNeverLoggedIn
+      When -Cutoff is set, excludes accounts with no lastLogonTimestamp value.
 
     -IncludeDisabled
-      Include disabled user accounts.
+      Include disabled accounts.
 
     -IncludeExpired
-      Include expired user accounts (AccountExpirationDate in the past).
+      Include expired accounts (AccountExpirationDate in the past).
+
+    -Fields
+      Output columns or lookup fields. No implicit columns are added.
+      Accepted forms:
+        -Fields mail,LastLogon,Modified,AccountState,OU
+        -Fields "mail,LastLogon,Modified,AccountState,OU"
+        -Fields mail LastLogon Modified AccountState OU
 
     -Csv / -Tsv
       Output as CSV or TSV.
 
+    -OutFile
+      Output file path.
+
   Examples:
-    .\Get-ActiveGroupMembers.ps1 "Domain Users"
-
-    .\Get-ActiveGroupMembers.ps1 "Domain Users" -Fields SamAccountName,Name,Email,uid -Tsv
-
-    .\Get-ActiveGroupMembers.ps1 "Domain Users" -Fields SamAccountName,Email -IncludeDisabled
+    .\Get-ADUserActivity.ps1 -SearchBase "OU=Users,DC=example,DC=com" -Cutoff 6m -Fields UserPrincipalName,mail,LastLogon,Modified,AccountState,OU -Tsv -OutFile .\users.tsv
 #>
 
-[CmdletBinding()]
+[CmdletBinding(DefaultParameterSetName = 'ByDomain')]
 param(
-    [Parameter(Mandatory = $true, Position = 0)]
-    [Alias('Group')]
-    [string]$GroupName,
+    [Parameter(ParameterSetName = 'ByDomain', Mandatory = $false)]
+    [string]$Domain,
+
+    [Parameter(ParameterSetName = 'BySearchBase', Mandatory = $false)]
+    [string]$SearchBase,
 
     [Parameter(Mandatory = $false)]
     [string[]]$Domains = @(),
 
     [Parameter(Mandatory = $false)]
-    [string[]]$Fields = @(),
+    [string]$Cutoff,
 
     [Parameter(Mandatory = $false)]
-    [switch]$Name,
-
-    [Parameter(Mandatory = $false)]
-    [switch]$Email,
-
-    [Parameter(Mandatory = $false)]
-    [string[]]$Attributes = @(),
+    [switch]$ExcludeNeverLoggedIn,
 
     [Parameter(Mandatory = $false)]
     [switch]$IncludeDisabled,
@@ -80,10 +105,16 @@ param(
     [switch]$IncludeExpired,
 
     [Parameter(Mandatory = $false)]
+    [object]$Fields,
+
+    [Parameter(Mandatory = $false)]
     [switch]$Csv,
 
     [Parameter(Mandatory = $false)]
-    [switch]$Tsv
+    [switch]$Tsv,
+
+    [Parameter(Mandatory = $false)]
+    [string]$OutFile
 )
 
 Set-StrictMode -Version Latest
@@ -93,320 +124,115 @@ if ($Csv -and $Tsv) {
     throw "Parameters -Csv and -Tsv are mutually exclusive."
 }
 
+if (-not (Get-Module -ListAvailable -Name ActiveDirectory)) {
+    throw "Required module 'ActiveDirectory' not found. Install RSAT Active Directory tools and retry."
+}
 Import-Module ActiveDirectory -ErrorAction Stop
 
+function Convert-CutoffToTimeSpan {
+    param([Parameter(Mandatory = $true)][string]$Value)
+
+    $v = $Value.Trim()
+    if ($v -notmatch '^(?<n>\d+)\s*(?<u>[hdwmyHDWMY])$') {
+        throw "Invalid -Cutoff '$Value'. Expected formats like 24h, 30d, 12w, 6m, 1y."
+    }
+
+    $n = [int]$Matches['n']
+    $u = $Matches['u'].ToLowerInvariant()
+
+    switch ($u) {
+        'h' { return [TimeSpan]::FromHours($n) }
+        'd' { return [TimeSpan]::FromDays($n) }
+        'w' { return [TimeSpan]::FromDays(7 * $n) }
+        'm' { return [TimeSpan]::FromDays(30 * $n) }
+        'y' { return [TimeSpan]::FromDays(365 * $n) }
+        default { throw "Unsupported cutoff unit '$u'." }
+    }
+}
+
+function Resolve-FieldList {
+    param([AllowNull()][object]$RawFields)
+
+    if ($null -eq $RawFields) { return @() }
+
+    $tokens = @()
+    foreach ($item in @($RawFields)) {
+        if ($null -eq $item) { continue }
+
+        $s = ([string]$item).Trim()
+        if ($s.Length -eq 0) { continue }
+
+        if ($s -match ',') {
+            $tokens += ($s -split '\s*,\s*')
+        } else {
+            $tokens += $s
+        }
+    }
+
+    $tokens =
+        @($tokens) |
+        ForEach-Object { ([string]$_).Trim() } |
+        Where-Object { $_ -and $_.Length -gt 0 } |
+        Select-Object -Unique
+
+    return @($tokens)
+}
+
 function Get-DomainFromDistinguishedName {
-    param(
-        [Parameter(Mandatory=$true)]
-        [string]$DistinguishedName
-    )
+    param([Parameter(Mandatory = $true)][string]$DistinguishedName)
 
     $dcParts = @()
     foreach ($part in ($DistinguishedName -split ',')) {
         $p = $part.Trim()
-        if ($p -match '^(?i)DC=(.+)$') {
-            $dcParts += $Matches[1]
-        }
+        if ($p -match '^(?i)DC=(.+)$') { $dcParts += $Matches[1] }
     }
 
-    if (@($dcParts).Count -gt 0) {
-        return ($dcParts -join '.')
-    }
-
+    if (@($dcParts).Count -gt 0) { return ($dcParts -join '.') }
     return $null
 }
 
 function Get-FallbackDomainList {
-    param(
-        [Parameter(Mandatory=$false)]
-        [AllowNull()]
-        [AllowEmptyCollection()]
-        [object]$ExplicitDomains
-    )
+    param([string[]]$ExplicitDomains)
 
-    # Treat scalar or array consistently
-    $explicitList = @()
-    if ($null -ne $ExplicitDomains) {
-        $explicitList = @($ExplicitDomains) | Where-Object { $_ -and ([string]$_).Trim().Length -gt 0 } | ForEach-Object { ([string]$_).Trim() }
-    }
+    $explicit =
+        @($ExplicitDomains) |
+        Where-Object { $_ -and ([string]$_).Trim().Length -gt 0 } |
+        ForEach-Object { ([string]$_).Trim() } |
+        Select-Object -Unique
 
-    if (@($explicitList).Count -gt 0) {
-        return [string[]]$explicitList
-    }
+    if (@($explicit).Count -gt 0) { return @($explicit) }
 
     try {
         $forest = Get-ADForest -ErrorAction Stop
-        if ($forest -and $forest.Domains -and @($forest.Domains).Count -gt 0) {
-            return [string[]]@($forest.Domains)
-        }
+        return @(@($forest.Domains) | ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ } | Select-Object -Unique)
     } catch {
-        # ignore
+        return @()
     }
-
-    return @()
 }
 
-function Get-ADUserCrossDomain {
-    param(
-        [Parameter(Mandatory=$true)]
-        [string]$DistinguishedName,
+function Get-ComputedLastLogon {
+    param([Parameter(Mandatory = $true)]$User)
 
-        [Parameter(Mandatory=$true)]
-        [string[]]$Properties,
-
-        [Parameter(Mandatory=$true)]
-        [object]$FallbackDomains
-    )
-
-    $tryList = New-Object System.Collections.Generic.List[string]
-
-    $dnDomain = Get-DomainFromDistinguishedName -DistinguishedName $DistinguishedName
-    if ($dnDomain) { [void]$tryList.Add($dnDomain) }
-
-    $fallbackList = @()
-    if ($null -ne $FallbackDomains) { $fallbackList = @($FallbackDomains) }
-
-    foreach ($d in $fallbackList) {
-        if (-not $d) { continue }
-        $ds = ([string]$d).Trim()
-        if (-not $ds) { continue }
-        if (-not $tryList.Contains($ds)) { [void]$tryList.Add($ds) }
-    }
-
-    if ($tryList.Count -eq 0) {
-        try { return Get-ADUser -Identity $DistinguishedName -Properties $Properties }
-        catch { return $null }
-    }
-
-    foreach ($tryDomain in $tryList) {
-        try {
-            return Get-ADUser -Server $tryDomain -Identity $DistinguishedName -Properties $Properties
-        } catch {
-            continue
-        }
-    }
-
-    return $null
+    $llt = $User.lastLogonTimestamp
+    if ($null -eq $llt -or $llt -eq 0) { return $null }
+    return [DateTime]::FromFileTime([Int64]$llt)
 }
 
-function Resolve-ADGroupCrossDomain {
-    param(
-        [Parameter(Mandatory=$true)]
-        [string]$Identity,
+function Get-ParentDn {
+    param([AllowNull()][string]$DistinguishedName)
 
-        [Parameter(Mandatory=$true)]
-        [object]$DomainList
-    )
+    if (-not $DistinguishedName) { return $null }
 
-    $dl = @()
-    if ($null -ne $DomainList) { $dl = @($DomainList) }
+    $parts = $DistinguishedName -split ',', 2
+    if ($parts.Count -lt 2) { return $null }
 
-    if (@($dl).Count -eq 0) {
-        return Get-ADGroup -Identity $Identity -ErrorAction Stop
-    }
-
-    foreach ($d in $dl) {
-        if (-not $d) { continue }
-        $ds = ([string]$d).Trim()
-        if (-not $ds) { continue }
-
-        try {
-            return Get-ADGroup -Server $ds -Identity $Identity -ErrorAction Stop
-        } catch {
-            continue
-        }
-    }
-
-    return $null
-}
-
-function Get-ADGroupMembersCrossDomain {
-    param(
-        [Parameter(Mandatory=$true)]
-        [Microsoft.ActiveDirectory.Management.ADGroup]$Group,
-
-        [Parameter(Mandatory=$true)]
-        [object]$DomainList
-    )
-
-    $groupDomain = $null
-    if ($Group.DistinguishedName) {
-        $groupDomain = Get-DomainFromDistinguishedName -DistinguishedName $Group.DistinguishedName
-    }
-
-    $dl = @()
-    if ($null -ne $DomainList) { $dl = @($DomainList) }
-
-    $tryList = New-Object System.Collections.Generic.List[string]
-    if ($groupDomain) { [void]$tryList.Add($groupDomain) }
-
-    foreach ($d in $dl) {
-        if (-not $d) { continue }
-        $ds = ([string]$d).Trim()
-        if (-not $ds) { continue }
-        if (-not $tryList.Contains($ds)) { [void]$tryList.Add($ds) }
-    }
-
-    if ($tryList.Count -eq 0) {
-        return Get-ADGroupMember -Identity $Group.DistinguishedName -Recursive -ErrorAction Stop
-    }
-
-    foreach ($d in $tryList) {
-        try {
-            return Get-ADGroupMember -Server $d -Identity $Group.DistinguishedName -Recursive -ErrorAction Stop
-        } catch {
-            continue
-        }
-    }
-
-    throw "Failed to enumerate members for group '$($Group.Name)'."
-}
-
-function ConvertTo-Tsv {
-    param(
-        [Parameter(Mandatory=$true)]
-        [object[]]$InputObject,
-
-        [Parameter(Mandatory=$true)]
-        [string[]]$Properties
-    )
-
-    $escape = {
-        param([object]$v)
-        if ($null -eq $v) { return '' }
-        $s = [string]$v
-        if ($s -match '[\t\r\n"]') {
-            return '"' + ($s -replace '"', '""') + '"'
-        }
-        return $s
-    }
-
-    $lines = New-Object System.Collections.Generic.List[string]
-    [void]$lines.Add(($Properties -join "`t"))
-
-    foreach ($row in $InputObject) {
-        $fields = foreach ($p in $Properties) {
-            & $escape ($row.$p)
-        }
-        [void]$lines.Add(($fields -join "`t"))
-    }
-
-    return ($lines -join "`r`n")
-}
-
-function Normalize-UniqueNonEmpty {
-    param([string[]]$Values)
-    if (-not $Values) { return @() }
-    $Values |
-        Where-Object { $_ -and $_.Trim().Length -gt 0 } |
-        ForEach-Object { $_.Trim() } |
-        Select-Object -Unique
-}
-
-function Convert-ADValueToDisplayString {
-    <#
-      Normalizes AD property values for table/CSV/TSV output.
-      - Multi-valued collections become a '; ' joined string.
-      - Byte arrays become "BINARY (N bytes)".
-    #>
-    param([AllowNull()][object]$Value)
-
-    if ($null -eq $Value) { return $null }
-
-    if ($Value -is [byte[]]) {
-        return ("BINARY ({0} bytes)" -f $Value.Length)
-    }
-
-    if (($Value -is [System.Collections.IEnumerable]) -and -not ($Value -is [string])) {
-        $items = @()
-        foreach ($item in $Value) {
-            if ($null -eq $item) { continue }
-            if ($item -is [byte[]]) { $items += ("BINARY ({0} bytes)" -f $item.Length) }
-            else { $items += [string]$item }
-        }
-        return ($items -join '; ')
-    }
-
-    return [string]$Value
-}
-
-function Build-FieldPlan {
-    param(
-        [string[]]$ExplicitFields,
-        [switch]$LegacyName,
-        [switch]$LegacyEmail,
-        [string[]]$LegacyAttributes
-    )
-
-    $columnToAdProp = [ordered]@{}
-    $outColumns = New-Object System.Collections.Generic.List[string]
-    $adProps = New-Object System.Collections.Generic.HashSet[string]([System.StringComparer]::OrdinalIgnoreCase)
-
-    $addColumn = {
-        param([string]$ColumnName, [string]$AdPropName)
-        if (-not $columnToAdProp.Contains($ColumnName)) {
-            $columnToAdProp[$ColumnName] = $AdPropName
-            [void]$outColumns.Add($ColumnName)
-        }
-        if ($AdPropName -and $AdPropName.Trim()) {
-            [void]$adProps.Add($AdPropName)
-        }
-    }
-
-    $explicit = Normalize-UniqueNonEmpty -Values $ExplicitFields
-
-    if (@($explicit).Count -gt 0) {
-        foreach ($f in $explicit) {
-            switch -Regex ($f) {
-                '^(?i)samaccountname$' { & $addColumn 'SamAccountName' 'SamAccountName' }
-                '^(?i)name$'           { & $addColumn 'Name' 'Name' }
-                '^(?i)email$'          { & $addColumn 'Email' 'mail' }
-                default                { & $addColumn $f $f }
-            }
-        }
-
-        if (-not $columnToAdProp.Contains('SamAccountName')) {
-            $existing = @($outColumns)
-            $outColumns.Clear()
-            & $addColumn 'SamAccountName' 'SamAccountName' | Out-Null
-            foreach ($c in $existing) { if ($c -ne 'SamAccountName') { [void]$outColumns.Add($c) } }
-        }
-
-        return [pscustomobject]@{
-            OutColumns     = [string[]]$outColumns
-            AdProps        = [string[]]$adProps
-            ColumnToAdProp = $columnToAdProp
-            UsesExplicit   = $true
-        }
-    }
-
-    & $addColumn 'SamAccountName' 'SamAccountName' | Out-Null
-    if ($LegacyName)  { & $addColumn 'Name' 'Name' | Out-Null }
-    if ($LegacyEmail) { & $addColumn 'Email' 'mail' | Out-Null }
-
-    $extras = Normalize-UniqueNonEmpty -Values $LegacyAttributes |
-        Where-Object { $_ -notin @('SamAccountName','Name','Email','mail') }
-
-    foreach ($p in $extras) {
-        & $addColumn $p $p | Out-Null
-    }
-
-    return [pscustomobject]@{
-        OutColumns     = [string[]]$outColumns
-        AdProps        = [string[]]$adProps
-        ColumnToAdProp = $columnToAdProp
-        UsesExplicit   = $false
-    }
+    return $parts[1]
 }
 
 function Test-UserIsActive {
-    <#
-      Returns $true if the account should be included, based on Enabled/expiration filters.
-    #>
     param(
-        [Parameter(Mandatory=$true)]
-        [Microsoft.ActiveDirectory.Management.ADUser]$UserObject,
-
+        [Parameter(Mandatory = $true)]$UserObject,
+        [Parameter(Mandatory = $true)][DateTime]$Now,
         [switch]$IncludeDisabled,
         [switch]$IncludeExpired
     )
@@ -420,113 +246,252 @@ function Test-UserIsActive {
     if (-not $IncludeExpired) {
         if ($UserObject.PSObject.Properties.Match('AccountExpirationDate').Count -gt 0) {
             $aed = $UserObject.AccountExpirationDate
-            if ($aed -is [DateTime]) {
-                if ($aed -lt (Get-Date)) { return $false }
-            }
+            if ($aed -is [DateTime] -and $aed -lt $Now) { return $false }
         }
     }
 
     return $true
 }
 
-# Build domain list
+function Get-AccountState {
+    param(
+        [Parameter(Mandatory = $true)]$User,
+        [Parameter(Mandatory = $true)][DateTime]$Now
+    )
+
+    $enabled = $true
+    if ($User.PSObject.Properties.Match('Enabled').Count -gt 0) {
+        $enabled = ($User.Enabled -eq $true)
+    }
+
+    $expired = $false
+    if ($User.PSObject.Properties.Match('AccountExpirationDate').Count -gt 0) {
+        $aed = $User.AccountExpirationDate
+        if ($aed -is [DateTime]) { $expired = ($aed -lt $Now) }
+    }
+
+    if ($enabled -and -not $expired) { return 'Active' }
+    if (-not $enabled -and -not $expired) { return 'Disabled' }
+    if ($enabled -and $expired) { return 'Expired' }
+    return 'Disabled+Expired'
+}
+
+function Build-PropertyRequestList {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string[]]$OutputColumns,
+
+        [Parameter(Mandatory = $true)]
+        [switch]$NeedsCutoff,
+
+        [Parameter(Mandatory = $true)]
+        [switch]$NeedsFiltering
+    )
+
+    $props = @()
+
+    foreach ($c in @($OutputColumns)) {
+        switch -Regex ($c) {
+            '^(?i)LastLogon$' {
+                if ($props -notcontains 'lastLogonTimestamp') { $props += 'lastLogonTimestamp' }
+            }
+            '^(?i)Modified$' {
+                if ($props -notcontains 'whenChanged') { $props += 'whenChanged' }
+            }
+            '^(?i)AccountState$' {
+                if ($props -notcontains 'Enabled') { $props += 'Enabled' }
+                if ($props -notcontains 'AccountExpirationDate') { $props += 'AccountExpirationDate' }
+            }
+            '^(?i)Email$' {
+                if ($props -notcontains 'mail') { $props += 'mail' }
+            }
+            '^(?i)(OU|OrganizationalUnit)$' {
+                if ($props -notcontains 'DistinguishedName') { $props += 'DistinguishedName' }
+            }
+            default {
+                if ($props -notcontains $c) { $props += $c }
+            }
+        }
+    }
+
+    if ($NeedsFiltering) {
+        if ($props -notcontains 'Enabled') { $props += 'Enabled' }
+        if ($props -notcontains 'AccountExpirationDate') { $props += 'AccountExpirationDate' }
+    }
+
+    if ($NeedsCutoff) {
+        if ($props -notcontains 'lastLogonTimestamp') { $props += 'lastLogonTimestamp' }
+    }
+
+    return @($props | Select-Object -Unique)
+}
+
+function ConvertTo-Tsv {
+    param(
+        [Parameter(Mandatory = $true)]
+        $InputObject,
+
+        [Parameter(Mandatory = $true)]
+        [string[]]$Properties
+    )
+
+    $props = @($Properties)
+    if (@($props).Count -eq 0) {
+        throw "Internal error: TSV property list is empty."
+    }
+
+    $rows = @($InputObject)
+
+    $escape = {
+        param([object]$v)
+        if ($null -eq $v) { return '' }
+        $s = [string]$v
+        if ($s -match '[\t\r\n"]') { return '"' + ($s -replace '"', '""') + '"' }
+        return $s
+    }
+
+    $lines = @()
+    $lines += ($props -join "`t")
+
+    foreach ($row in $rows) {
+        $vals = foreach ($p in $props) { & $escape ($row.$p) }
+        $lines += ($vals -join "`t")
+    }
+
+    return ($lines -join "`r`n")
+}
+
+# Determine target domains to try
+$now = Get-Date
 $fallbackDomains = Get-FallbackDomainList -ExplicitDomains $Domains
 
-# Resolve group across domains
-$group = $null
-try {
-    $group = Resolve-ADGroupCrossDomain -Identity $GroupName -DomainList $fallbackDomains
-} catch {
-    $group = $null
+$tryList = @()
+
+if ($SearchBase -and $SearchBase.Trim()) {
+    $dnDomain = Get-DomainFromDistinguishedName -DistinguishedName $SearchBase
+    if ($dnDomain) { $tryList += $dnDomain }
 }
 
-if (-not $group) {
-    if ($fallbackDomains -and @($fallbackDomains).Count -gt 0) {
-        throw "Failed to resolve group '$GroupName' using domains: $($fallbackDomains -join ', ')"
-    }
-    throw "Failed to resolve group '$GroupName' in the current domain context, and domain discovery was not available. Specify -Domains for cross-domain resolution."
+if ($Domain -and $Domain.Trim()) { $tryList += $Domain.Trim() }
+$tryList += @($fallbackDomains)
+
+$tryList =
+    @($tryList) |
+    Where-Object { $_ -and ([string]$_).Trim().Length -gt 0 } |
+    ForEach-Object { ([string]$_).Trim() } |
+    Select-Object -Unique
+
+if (@($tryList).Count -eq 0) {
+    throw "No domain context available. Specify -Domain, -SearchBase, or -Domains."
 }
 
-$members = Get-ADGroupMembersCrossDomain -Group $group -DomainList $fallbackDomains
+# Resolve output columns
+$resolvedFields = Resolve-FieldList -RawFields $Fields
 
-# Build field plan (columns + AD properties)
-$fieldPlan = Build-FieldPlan -ExplicitFields $Fields -LegacyName:$Name -LegacyEmail:$Email -LegacyAttributes $Attributes
-$outProps = $fieldPlan.OutColumns
-$adProps = $fieldPlan.AdProps
-$colToProp = $fieldPlan.ColumnToAdProp
-
-# Always request these for filtering (even if not output)
-$requiredForFilter = @('Enabled', 'AccountExpirationDate')
-foreach ($rf in $requiredForFilter) {
-    if ($adProps -notcontains $rf) {
-        $adProps = @($adProps + $rf)
-    }
+if (@($resolvedFields).Count -eq 0) {
+    $resolvedFields = @(
+        'SamAccountName','Name','mail','Enabled','AccountState',
+        'AccountExpirationDate','LastLogon','Modified','DistinguishedName'
+    )
 }
 
-# Determine whether structured output is needed
-$needsStructured = $false
-if ($fieldPlan.UsesExplicit) {
-    if (@($outProps).Count -gt 1) { $needsStructured = $true }
-} else {
-    if ($Name -or $Email -or (@($Attributes).Count -gt 0)) { $needsStructured = $true }
+# Cutoff
+$cutoffDate = $null
+if ($Cutoff -and $Cutoff.Trim()) {
+    $cutoffDate = $now.Add(-(Convert-CutoffToTimeSpan -Value $Cutoff))
 }
-if ($Csv -or $Tsv) { $needsStructured = $true }
 
-# If still not structured, output usernames only (but still apply active filters)
-if (-not $needsStructured) {
-    $namesOnly = New-Object System.Collections.Generic.List[string]
-    foreach ($m in @($members)) {
-        if ($m.objectClass -ne 'user') { continue }
-        if (-not $m.DistinguishedName) { continue }
+$needsCutoff = [bool]($cutoffDate -ne $null)
+$needsFiltering = $true
 
-        $u = Get-ADUserCrossDomain -DistinguishedName $m.DistinguishedName -Properties $adProps -FallbackDomains $fallbackDomains
-        if (-not $u) { continue }
+$adProps = Build-PropertyRequestList -OutputColumns $resolvedFields -NeedsCutoff:$needsCutoff -NeedsFiltering:$needsFiltering
 
-        if (-not (Test-UserIsActive -UserObject $u -IncludeDisabled:$IncludeDisabled -IncludeExpired:$IncludeExpired)) {
-            continue
+# Query users
+$users = $null
+$lastErr = $null
+
+foreach ($srv in @($tryList)) {
+    try {
+        if ($SearchBase -and $SearchBase.Trim()) {
+            $users = Get-ADUser -Server $srv -SearchBase $SearchBase -SearchScope Subtree -Filter * -Properties $adProps -ErrorAction Stop
+        } else {
+            $users = Get-ADUser -Server $srv -Filter * -Properties $adProps -ErrorAction Stop
         }
-
-        if ($u.SamAccountName) { [void]$namesOnly.Add([string]$u.SamAccountName) }
+        $lastErr = $null
+        break
+    } catch {
+        $lastErr = $_
+        continue
     }
-    $namesOnly | Sort-Object -Unique
-    exit 0
 }
 
-# Structured output: build rows with normalized display values, apply active filters
-$results = New-Object System.Collections.Generic.List[object]
+if (-not $users) {
+    if ($lastErr) { throw "Failed to query users. Last error: $($lastErr.Exception.Message)" }
+    throw "Failed to query users."
+}
 
-foreach ($m in @($members)) {
-    if ($m.objectClass -ne 'user') { continue }
-    if (-not $m.DistinguishedName) { continue }
+# Filter and shape output
+$results = @()
 
-    $u = Get-ADUserCrossDomain -DistinguishedName $m.DistinguishedName -Properties $adProps -FallbackDomains $fallbackDomains
-    if (-not $u) { continue }
+foreach ($u in @($users)) {
+    if (-not (Test-UserIsActive -UserObject $u -Now $now -IncludeDisabled:$IncludeDisabled -IncludeExpired:$IncludeExpired)) { continue }
 
-    if (-not (Test-UserIsActive -UserObject $u -IncludeDisabled:$IncludeDisabled -IncludeExpired:$IncludeExpired)) {
-        continue
+    if ($cutoffDate) {
+        $ll = Get-ComputedLastLogon -User $u
+        if ($null -eq $ll) {
+            if ($ExcludeNeverLoggedIn) { continue }
+        } else {
+            if ($ll -ge $cutoffDate) { continue }
+        }
     }
 
     $row = [ordered]@{}
-    foreach ($col in $outProps) {
-        $adProp = $colToProp[$col]
-        $row[$col] = Convert-ADValueToDisplayString -Value ($u.$adProp)
+    foreach ($col in @($resolvedFields)) {
+        switch -Regex ($col) {
+            '^(?i)LastLogon$' {
+                $row[$col] = Get-ComputedLastLogon -User $u
+                break
+            }
+            '^(?i)Modified$' {
+                $row[$col] = $u.whenChanged
+                break
+            }
+            '^(?i)AccountState$' {
+                $row[$col] = Get-AccountState -User $u -Now $now
+                break
+            }
+            '^(?i)Email$' {
+                $row[$col] = $u.mail
+                break
+            }
+            '^(?i)(OU|OrganizationalUnit)$' {
+                $row[$col] = Get-ParentDn -DistinguishedName $u.DistinguishedName
+                break
+            }
+            default {
+                $row[$col] = $u.$col
+                break
+            }
+        }
     }
 
-    [void]$results.Add([pscustomobject]$row)
+    $results += [pscustomobject]$row
 }
 
-# Sort + unique by SamAccountName
-$sorted = $results | Sort-Object -Property SamAccountName -Unique
-
+# Output
 if ($Csv) {
-    $sorted | Select-Object -Property $outProps | ConvertTo-Csv -NoTypeInformation
-    exit 0
+    $text = (@($results | Select-Object -Property $resolvedFields | ConvertTo-Csv -NoTypeInformation)) -join "`r`n"
+    if ($OutFile) { Set-Content -Path $OutFile -Value $text -Encoding utf8 }
+    $text
+    return
 }
 
 if ($Tsv) {
-    $selected = $sorted | Select-Object -Property $outProps
-    ConvertTo-Tsv -InputObject $selected -Properties $outProps
-    exit 0
+    $selected = @($results | Select-Object -Property $resolvedFields)
+    $text = ConvertTo-Tsv -InputObject $selected -Properties $resolvedFields
+    if ($OutFile) { Set-Content -Path $OutFile -Value $text -Encoding utf8 }
+    $text
+    return
 }
 
-$sorted | Select-Object -Property $outProps
+$results | Select-Object -Property $resolvedFields
