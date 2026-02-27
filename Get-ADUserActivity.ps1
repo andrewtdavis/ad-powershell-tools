@@ -1,58 +1,48 @@
-<#
+ <#
 .INFO
   Synopsis:
-    List Active Directory user last-logon and modification activity for a domain or OU, optionally filtering by a staleness cutoff.
+    Query Active Directory user activity and export selected fields (CSV/TSV), optionally filtering by last-logon staleness.
 
   Description:
-    Queries Active Directory for users in a target scope and outputs activity fields such as:
-      - LastLogon (derived from lastLogonTimestamp - replicated, may lag)
-      - Modified (whenChanged)
+    Queries Active Directory users within a domain or an OU search base and outputs requested fields.
 
-    Scope selection:
-      - Use -SearchBase with an OU distinguished name to target a specific OU subtree.
-      - Use -Domain to target an entire domain.
+    Activity fields:
+      - LastLogon is computed from lastLogonTimestamp (replicated, may lag).
+      - Modified is read from whenChanged.
 
-    Cross-domain behavior:
-      - When -Domains is provided, it is used as the fallback domain list.
-      - When -Domains is omitted, the script attempts to discover domains from the current forest.
+    Cutoff behavior:
+      - When -Cutoff is specified, results include users whose LastLogon is:
+          * missing (never or not recorded), unless -ExcludeNeverLoggedIn is set
+          * older than (Now - Cutoff)
 
     Account filtering:
-      - By default, disabled users and expired users are excluded:
-          * Enabled -eq $false
-          * AccountExpirationDate is set and < now
-      - Use -IncludeDisabled and/or -IncludeExpired to override.
-
-    Cutoff filtering:
-      - Use -Cutoff with values like 30d, 6m, 12w, 1y, 24h.
-      - When -Cutoff is set, output includes accounts whose last logon is:
-          - missing (never or not recorded), unless -ExcludeNeverLoggedIn is set
-          - older than (Now - Cutoff)
+      - By default, disabled and expired accounts are excluded.
+      - Use -IncludeDisabled and/or -IncludeExpired to include them.
 
     Field selection:
-      - If -Fields is provided, it defines output columns and which AD attributes are requested.
-        Special aliases:
-          * Email      -> AD attribute mail, output column name Email
-          * LastLogon  -> computed from lastLogonTimestamp
-          * Modified   -> AD attribute whenChanged, output column name Modified
-          * AccountState -> computed from Enabled + AccountExpirationDate
-      - If -Fields is not provided, a default activity view is returned:
-          SamAccountName,Name,Email,Enabled,AccountState,AccountExpirationDate,LastLogon,Modified,DistinguishedName
+      - -Fields defines output columns exactly. No implicit columns are added.
+      - Computed aliases supported:
+          * LastLogon
+          * Modified
+          * AccountState (computed from Enabled + AccountExpirationDate)
+      - Common alias:
+          * Email (maps to mail)
+      - Any other token is treated as an AD attribute name (example: mail, department, employeeID).
 
-    Output behavior:
-      - By default, outputs objects.
-      - Use -Csv or -Tsv to output delimited text.
+    Output:
+      - Default: objects
+      - -Csv or -Tsv: outputs delimited text
+      - -OutFile: writes the chosen output format to a file (still outputs to stdout)
 
   Parameters:
     -Domain
-      Domain DNS name or domain controller to query, for example: example.com
+      Domain DNS name or domain controller to query.
 
     -SearchBase
-      Distinguished name of an OU (or container) used as the query root.
-      Example: OU=Users,DC=example,DC=com
-      Search scope is Subtree.
+      Distinguished name (DN) of an OU/container used as query root (subtree).
 
     -Domains
-      One or more domains or domain controllers to use as a fallback list for queries.
+      One or more domains/domain controllers used as fallback targets for query execution.
 
     -Cutoff
       Staleness cutoff in compact form: <number><unit>
@@ -60,38 +50,35 @@
           h = hours
           d = days
           w = weeks
-          m = months (30 days each)
-          y = years (365 days each)
-      Examples: 24h, 30d, 6m, 12w, 1y
+          m = months (30 days)
+          y = years (365 days)
+      Examples: 24h, 30d, 6m, 1y
 
     -ExcludeNeverLoggedIn
-      When -Cutoff is set, excludes accounts where last logon is missing.
+      When -Cutoff is set, excludes accounts with no lastLogonTimestamp value.
 
     -IncludeDisabled
-      Include disabled user accounts.
+      Include disabled accounts.
 
     -IncludeExpired
-      Include expired user accounts (AccountExpirationDate in the past).
+      Include expired accounts (AccountExpirationDate in the past).
 
     -Fields
-      Optional. Explicit output columns / lookup fields.
-      Examples: SamAccountName,Name,Email,LastLogon,Modified,whenCreated,department
+      Output columns / lookup fields. No implicit columns are added.
+      Accepted forms:
+        -Fields mail,LastLogon,Modified,AccountState
+        -Fields "mail,LastLogon,Modified,AccountState"
+        -Fields mail LastLogon Modified AccountState
 
     -Csv / -Tsv
       Output as CSV or TSV.
 
+    -OutFile
+      Output file path.
+
   Examples:
-    # Entire domain, default fields (disabled/expired excluded by default)
-    .\Get-ADUserActivity.ps1 -Domain example.com
-
-    # OU subtree with staleness cutoff
-    .\Get-ADUserActivity.ps1 -SearchBase "OU=Users,DC=example,DC=com" -Cutoff 6m
-
-    # Include expired accounts explicitly
-    .\Get-ADUserActivity.ps1 -Domain example.com -IncludeExpired
-
-    # Explicit fields, TSV output
-    .\Get-ADUserActivity.ps1 -Domain example.com -Fields SamAccountName,Email,LastLogon,Modified,AccountState -Tsv
+    .\Get-ADUserActivity.ps1 -SearchBase "OU=Users,DC=example,DC=com" -Cutoff 6m -Fields mail,LastLogon,Modified,AccountState -Tsv -OutFile .\users.tsv
+    .\Get-ADUserActivity.ps1 -Domain example.com -Fields SamAccountName,mail,LastLogon -Csv -OutFile .\users.csv
 #>
 
 [CmdletBinding(DefaultParameterSetName = 'ByDomain')]
@@ -118,13 +105,16 @@ param(
     [switch]$IncludeExpired,
 
     [Parameter(Mandatory = $false)]
-    [string[]]$Fields = @(),
+    [object]$Fields,
 
     [Parameter(Mandatory = $false)]
     [switch]$Csv,
 
     [Parameter(Mandatory = $false)]
-    [switch]$Tsv
+    [switch]$Tsv,
+
+    [Parameter(Mandatory = $false)]
+    [string]$OutFile
 )
 
 Set-StrictMode -Version Latest
@@ -134,125 +124,13 @@ if ($Csv -and $Tsv) {
     throw "Parameters -Csv and -Tsv are mutually exclusive."
 }
 
+if (-not (Get-Module -ListAvailable -Name ActiveDirectory)) {
+    throw "Required module 'ActiveDirectory' not found. Install RSAT Active Directory tools and retry."
+}
 Import-Module ActiveDirectory -ErrorAction Stop
 
-function Get-DomainFromDistinguishedName {
-    param(
-        [Parameter(Mandatory=$true)]
-        [string]$DistinguishedName
-    )
-
-    $dcParts = @()
-    foreach ($part in ($DistinguishedName -split ',')) {
-        $p = $part.Trim()
-        if ($p -match '^(?i)DC=(.+)$') {
-            $dcParts += $Matches[1]
-        }
-    }
-
-    if (@($dcParts).Count -gt 0) {
-        return ($dcParts -join '.')
-    }
-
-    return $null
-}
-
-function Get-FallbackDomainList {
-    param(
-        [Parameter(Mandatory=$false)]
-        [AllowNull()]
-        [AllowEmptyCollection()]
-        [object]$ExplicitDomains
-    )
-
-    $explicitList = @()
-    if ($null -ne $ExplicitDomains) {
-        $explicitList = @($ExplicitDomains) |
-            Where-Object { $_ -and ([string]$_).Trim().Length -gt 0 } |
-            ForEach-Object { ([string]$_).Trim() }
-    }
-
-    if (@($explicitList).Count -gt 0) {
-        return [string[]]$explicitList
-    }
-
-    try {
-        $forest = Get-ADForest -ErrorAction Stop
-        if ($forest -and $forest.Domains -and @($forest.Domains).Count -gt 0) {
-            return [string[]]@($forest.Domains)
-        }
-    } catch {
-        # ignore
-    }
-
-    return @()
-}
-
-function Normalize-UniqueNonEmpty {
-    param([string[]]$Values)
-    if (-not $Values) { return @() }
-    $Values |
-        Where-Object { $_ -and $_.Trim().Length -gt 0 } |
-        ForEach-Object { $_.Trim() } |
-        Select-Object -Unique
-}
-
-function Convert-ADValueToDisplayString {
-    param([AllowNull()][object]$Value)
-
-    if ($null -eq $Value) { return $null }
-
-    if ($Value -is [byte[]]) {
-        return ("BINARY ({0} bytes)" -f $Value.Length)
-    }
-
-    if (($Value -is [System.Collections.IEnumerable]) -and -not ($Value -is [string])) {
-        $items = @()
-        foreach ($item in $Value) {
-            if ($null -eq $item) { continue }
-            if ($item -is [byte[]]) { $items += ("BINARY ({0} bytes)" -f $item.Length) }
-            else { $items += [string]$item }
-        }
-        return ($items -join '; ')
-    }
-
-    return [string]$Value
-}
-
-function ConvertTo-Tsv {
-    param(
-        [Parameter(Mandatory=$true)]
-        [object[]]$InputObject,
-
-        [Parameter(Mandatory=$true)]
-        [string[]]$Properties
-    )
-
-    $escape = {
-        param([object]$v)
-        if ($null -eq $v) { return '' }
-        $s = [string]$v
-        if ($s -match '[\t\r\n"]') {
-            return '"' + ($s -replace '"', '""') + '"'
-        }
-        return $s
-    }
-
-    $lines = New-Object System.Collections.Generic.List[string]
-    [void]$lines.Add(($Properties -join "`t"))
-
-    foreach ($row in $InputObject) {
-        $fields = foreach ($p in $Properties) {
-            & $escape ($row.$p)
-        }
-        [void]$lines.Add(($fields -join "`t"))
-    }
-
-    return ($lines -join "`r`n")
-}
-
-function Parse-CutoffToTimeSpan {
-    param([Parameter(Mandatory=$true)][string]$Value)
+function Convert-CutoffToTimeSpan {
+    param([Parameter(Mandatory = $true)][string]$Value)
 
     $v = $Value.Trim()
     if ($v -notmatch '^(?<n>\d+)\s*(?<u>[hdwmyHDWMY])$') {
@@ -272,11 +150,79 @@ function Parse-CutoffToTimeSpan {
     }
 }
 
+function Resolve-FieldList {
+    param([AllowNull()][object]$RawFields)
+
+    if ($null -eq $RawFields) { return @() }
+
+    $tokens = @()
+
+    foreach ($item in @($RawFields)) {
+        if ($null -eq $item) { continue }
+
+        $s = ([string]$item).Trim()
+        if ($s.Length -eq 0) { continue }
+
+        if ($s -match ',') {
+            $tokens += ($s -split '\s*,\s*')
+        } else {
+            $tokens += $s
+        }
+    }
+
+    $tokens =
+        @($tokens) |
+        ForEach-Object { ([string]$_).Trim() } |
+        Where-Object { $_ -and $_.Length -gt 0 } |
+        Select-Object -Unique
+
+    return @($tokens)
+}
+
+function Get-DomainFromDistinguishedName {
+    param([Parameter(Mandatory = $true)][string]$DistinguishedName)
+
+    $dcParts = @()
+    foreach ($part in ($DistinguishedName -split ',')) {
+        $p = $part.Trim()
+        if ($p -match '^(?i)DC=(.+)$') { $dcParts += $Matches[1] }
+    }
+
+    if (@($dcParts).Count -gt 0) { return ($dcParts -join '.') }
+    return $null
+}
+
+function Get-FallbackDomainList {
+    param([string[]]$ExplicitDomains)
+
+    $explicit =
+        @($ExplicitDomains) |
+        Where-Object { $_ -and ([string]$_).Trim().Length -gt 0 } |
+        ForEach-Object { ([string]$_).Trim() } |
+        Select-Object -Unique
+
+    if (@($explicit).Count -gt 0) { return @($explicit) }
+
+    try {
+        $forest = Get-ADForest -ErrorAction Stop
+        return @(@($forest.Domains) | ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ } | Select-Object -Unique)
+    } catch {
+        return @()
+    }
+}
+
+function Get-ComputedLastLogon {
+    param([Parameter(Mandatory = $true)]$User)
+
+    $llt = $User.lastLogonTimestamp
+    if ($null -eq $llt -or $llt -eq 0) { return $null }
+    return [DateTime]::FromFileTime([Int64]$llt)
+}
+
 function Test-UserIsActive {
     param(
-        [Parameter(Mandatory=$true)]
-        [Microsoft.ActiveDirectory.Management.ADUser]$UserObject,
-
+        [Parameter(Mandatory = $true)]$UserObject,
+        [Parameter(Mandatory = $true)][DateTime]$Now,
         [switch]$IncludeDisabled,
         [switch]$IncludeExpired
     )
@@ -290,26 +236,18 @@ function Test-UserIsActive {
     if (-not $IncludeExpired) {
         if ($UserObject.PSObject.Properties.Match('AccountExpirationDate').Count -gt 0) {
             $aed = $UserObject.AccountExpirationDate
-            if ($aed -is [DateTime]) {
-                if ($aed -lt (Get-Date)) { return $false }
-            }
+            if ($aed -is [DateTime] -and $aed -lt $Now) { return $false }
         }
     }
 
     return $true
 }
 
-function Get-ComputedLastLogon {
-    param([Parameter(Mandatory=$true)][object]$User)
-
-    $llt = $User.lastLogonTimestamp
-    if ($null -eq $llt -or $llt -eq 0) { return $null }
-
-    return [DateTime]::FromFileTime([Int64]$llt)
-}
-
 function Get-AccountState {
-    param([Parameter(Mandatory=$true)][object]$User)
+    param(
+        [Parameter(Mandatory = $true)]$User,
+        [Parameter(Mandatory = $true)][DateTime]$Now
+    )
 
     $enabled = $true
     if ($User.PSObject.Properties.Match('Enabled').Count -gt 0) {
@@ -317,12 +255,9 @@ function Get-AccountState {
     }
 
     $expired = $false
-    $aed = $null
     if ($User.PSObject.Properties.Match('AccountExpirationDate').Count -gt 0) {
         $aed = $User.AccountExpirationDate
-        if ($aed -is [DateTime]) {
-            $expired = ($aed -lt (Get-Date))
-        }
+        if ($aed -is [DateTime]) { $expired = ($aed -lt $Now) }
     }
 
     if ($enabled -and -not $expired) { return 'Active' }
@@ -331,128 +266,132 @@ function Get-AccountState {
     return 'Disabled+Expired'
 }
 
-function Build-FieldPlan {
-    param([string[]]$ExplicitFields)
+function Build-PropertyRequestList {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string[]]$OutputColumns,
 
-    $columnToAdProp = [ordered]@{}
-    $outColumns = New-Object System.Collections.Generic.List[string]
-    $adProps = New-Object System.Collections.Generic.HashSet[string]([System.StringComparer]::OrdinalIgnoreCase)
+        [Parameter(Mandatory = $true)]
+        [switch]$NeedsCutoff,
 
-    $addColumn = {
-        param([string]$ColumnName, [string]$AdPropName)
-        if (-not $columnToAdProp.Contains($ColumnName)) {
-            $columnToAdProp[$ColumnName] = $AdPropName
-            [void]$outColumns.Add($ColumnName)
-        }
-        if ($AdPropName -and $AdPropName.Trim()) {
-            [void]$adProps.Add($AdPropName)
-        }
-    }
+        [Parameter(Mandatory = $true)]
+        [switch]$NeedsFiltering
+    )
 
-    $explicit = Normalize-UniqueNonEmpty -Values $ExplicitFields
+    $props = @()
 
-    if (@($explicit).Count -gt 0) {
-        foreach ($f in $explicit) {
-            switch -Regex ($f) {
-                '^(?i)samaccountname$' { & $addColumn 'SamAccountName' 'SamAccountName' }
-                '^(?i)name$'           { & $addColumn 'Name' 'Name' }
-                '^(?i)email$'          { & $addColumn 'Email' 'mail' }
-                '^(?i)modified$'       { & $addColumn 'Modified' 'whenChanged' }
-                '^(?i)lastlogon$'      { & $addColumn 'LastLogon' 'lastLogonTimestamp' }
-                '^(?i)accountstate$'   { & $addColumn 'AccountState' 'Enabled' }
-                default                { & $addColumn $f $f }
-            }
-        }
-
-        if (-not $columnToAdProp.Contains('SamAccountName')) {
-            $existing = @($outColumns)
-            $outColumns.Clear()
-            & $addColumn 'SamAccountName' 'SamAccountName' | Out-Null
-            foreach ($c in $existing) { if ($c -ne 'SamAccountName') { [void]$outColumns.Add($c) } }
-        }
-
-        return [pscustomobject]@{
-            OutColumns     = [string[]]$outColumns
-            AdProps        = [string[]]$adProps
-            ColumnToAdProp = $columnToAdProp
-            UsesExplicit   = $true
+    foreach ($c in @($OutputColumns)) {
+        switch -Regex ($c) {
+            '^(?i)LastLogon$'    { if ($props -notcontains 'lastLogonTimestamp') { $props += 'lastLogonTimestamp' } }
+            '^(?i)Modified$'     { if ($props -notcontains 'whenChanged') { $props += 'whenChanged' } }
+            '^(?i)AccountState$' { if ($props -notcontains 'Enabled') { $props += 'Enabled' }; if ($props -notcontains 'AccountExpirationDate') { $props += 'AccountExpirationDate' } }
+            '^(?i)Email$'        { if ($props -notcontains 'mail') { $props += 'mail' } }
+            default              { if ($props -notcontains $c) { $props += $c } }
         }
     }
 
-    # Default activity view
-    & $addColumn 'SamAccountName' 'SamAccountName' | Out-Null
-    & $addColumn 'Name' 'Name' | Out-Null
-    & $addColumn 'Email' 'mail' | Out-Null
-    & $addColumn 'Enabled' 'Enabled' | Out-Null
-    & $addColumn 'AccountState' 'Enabled' | Out-Null
-    & $addColumn 'AccountExpirationDate' 'AccountExpirationDate' | Out-Null
-    & $addColumn 'LastLogon' 'lastLogonTimestamp' | Out-Null
-    & $addColumn 'Modified' 'whenChanged' | Out-Null
-    & $addColumn 'DistinguishedName' 'DistinguishedName' | Out-Null
-
-    return [pscustomobject]@{
-        OutColumns     = [string[]]$outColumns
-        AdProps        = [string[]]$adProps
-        ColumnToAdProp = $columnToAdProp
-        UsesExplicit   = $false
+    if ($NeedsFiltering) {
+        if ($props -notcontains 'Enabled') { $props += 'Enabled' }
+        if ($props -notcontains 'AccountExpirationDate') { $props += 'AccountExpirationDate' }
     }
+
+    if ($NeedsCutoff) {
+        if ($props -notcontains 'lastLogonTimestamp') { $props += 'lastLogonTimestamp' }
+    }
+
+    return @($props | Select-Object -Unique)
 }
 
-# Domain list (fallback)
+function ConvertTo-Tsv {
+    param(
+        [Parameter(Mandatory = $true)]
+        $InputObject,
+
+        [Parameter(Mandatory = $true)]
+        [string[]]$Properties
+    )
+
+    $props = @($Properties)
+    if (@($props).Count -eq 0) {
+        throw "Internal error: TSV property list is empty."
+    }
+
+    $rows = @($InputObject)
+
+    $escape = {
+        param([object]$v)
+        if ($null -eq $v) { return '' }
+        $s = [string]$v
+        if ($s -match '[\t\r\n"]') {
+            return '"' + ($s -replace '"', '""') + '"'
+        }
+        return $s
+    }
+
+    $lines = @()
+    $lines += ($props -join "`t")
+
+    foreach ($row in $rows) {
+        $vals = foreach ($p in $props) { & $escape ($row.$p) }
+        $lines += ($vals -join "`t")
+    }
+
+    return ($lines -join "`r`n")
+}
+
+# Determine target domains to try
+$now = Get-Date
 $fallbackDomains = Get-FallbackDomainList -ExplicitDomains $Domains
 
-# Try list for the query:
-# - If SearchBase is set, first try DN-derived domain
-# - If Domain is set, prefer it
-$tryList = New-Object System.Collections.Generic.List[string]
+$tryList = @()
 
-if ($SearchBase) {
+if ($SearchBase -and $SearchBase.Trim()) {
     $dnDomain = Get-DomainFromDistinguishedName -DistinguishedName $SearchBase
-    if ($dnDomain) { [void]$tryList.Add($dnDomain) }
+    if ($dnDomain) { $tryList += $dnDomain }
 }
 
-if ($Domain -and $Domain.Trim()) {
-    $d = $Domain.Trim()
-    if (-not $tryList.Contains($d)) { [void]$tryList.Add($d) }
-}
+if ($Domain -and $Domain.Trim()) { $tryList += $Domain.Trim() }
+$tryList += @($fallbackDomains)
 
-foreach ($d in @($fallbackDomains)) {
-    if (-not $d) { continue }
-    $ds = ([string]$d).Trim()
-    if (-not $ds) { continue }
-    if (-not $tryList.Contains($ds)) { [void]$tryList.Add($ds) }
-}
+$tryList =
+    @($tryList) |
+    Where-Object { $_ -and ([string]$_).Trim().Length -gt 0 } |
+    ForEach-Object { ([string]$_).Trim() } |
+    Select-Object -Unique
 
-if ($tryList.Count -eq 0) {
+if (@($tryList).Count -eq 0) {
     throw "No domain context available. Specify -Domain, -SearchBase, or -Domains."
+}
+
+# Resolve output columns
+$resolvedFields = Resolve-FieldList -RawFields $Fields
+
+if (@($resolvedFields).Count -eq 0) {
+    # Default view only when -Fields not provided
+    $resolvedFields = @(
+        'SamAccountName','Name','mail','Enabled','AccountState',
+        'AccountExpirationDate','LastLogon','Modified','DistinguishedName'
+    )
 }
 
 # Cutoff
 $cutoffDate = $null
 if ($Cutoff -and $Cutoff.Trim()) {
-    $span = Parse-CutoffToTimeSpan -Value $Cutoff
-    $cutoffDate = (Get-Date).Add(-$span)
+    $cutoffDate = $now.Add(-(Convert-CutoffToTimeSpan -Value $Cutoff))
 }
 
-# Field plan and required properties
-$fieldPlan = Build-FieldPlan -ExplicitFields $Fields
-$outProps = $fieldPlan.OutColumns
-$adProps  = $fieldPlan.AdProps
-$colToProp = $fieldPlan.ColumnToAdProp
+Write-Verbose ("Resolved Fields: {0}" -f ($resolvedFields -join ', '))
 
-# Always request these for filtering and computed fields
-$required = @('Enabled','AccountExpirationDate','lastLogonTimestamp','whenChanged','mail','SamAccountName','DistinguishedName','Name')
-foreach ($r in $required) {
-    if ($adProps -notcontains $r) {
-        $adProps = @($adProps + $r)
-    }
-}
+$needsCutoff = [bool]($cutoffDate -ne $null)
+$needsFiltering = $true
 
-# Query users (try domains until success)
+$adProps = Build-PropertyRequestList -OutputColumns $resolvedFields -NeedsCutoff:$needsCutoff -NeedsFiltering:$needsFiltering
+
+# Query users
 $users = $null
 $lastErr = $null
 
-foreach ($srv in $tryList) {
+foreach ($srv in @($tryList)) {
     try {
         if ($SearchBase -and $SearchBase.Trim()) {
             $users = Get-ADUser -Server $srv -SearchBase $SearchBase -SearchScope Subtree -Filter * -Properties $adProps -ErrorAction Stop
@@ -468,18 +407,15 @@ foreach ($srv in $tryList) {
 }
 
 if (-not $users) {
-    if ($lastErr) {
-        throw "Failed to query users. Last error: $($lastErr.Exception.Message)"
-    }
+    if ($lastErr) { throw "Failed to query users. Last error: $($lastErr.Exception.Message)" }
     throw "Failed to query users."
 }
 
-# Apply active filtering (disabled/expired) like the toolkit default
-$filtered = New-Object System.Collections.Generic.List[object]
+# Filter and shape output
+$results = @()
+
 foreach ($u in @($users)) {
-    if (-not (Test-UserIsActive -UserObject $u -IncludeDisabled:$IncludeDisabled -IncludeExpired:$IncludeExpired)) {
-        continue
-    }
+    if (-not (Test-UserIsActive -UserObject $u -Now $now -IncludeDisabled:$IncludeDisabled -IncludeExpired:$IncludeExpired)) { continue }
 
     if ($cutoffDate) {
         $ll = Get-ComputedLastLogon -User $u
@@ -490,54 +426,34 @@ foreach ($u in @($users)) {
         }
     }
 
-    [void]$filtered.Add($u)
-}
-
-# Build output rows with normalization and computed aliases
-$results = New-Object System.Collections.Generic.List[object]
-
-foreach ($u in @($filtered)) {
     $row = [ordered]@{}
-    foreach ($col in $outProps) {
+    foreach ($col in @($resolvedFields)) {
         switch -Regex ($col) {
-            '^(?i)LastLogon$' {
-                $row[$col] = Get-ComputedLastLogon -User $u
-                break
-            }
-            '^(?i)Modified$' {
-                $row[$col] = $u.whenChanged
-                break
-            }
-            '^(?i)AccountState$' {
-                $row[$col] = Get-AccountState -User $u
-                break
-            }
-            default {
-                $adProp = $colToProp[$col]
-                $row[$col] = Convert-ADValueToDisplayString -Value ($u.$adProp)
-                break
-            }
+            '^(?i)LastLogon$'    { $row[$col] = Get-ComputedLastLogon -User $u; break }
+            '^(?i)Modified$'     { $row[$col] = $u.whenChanged; break }
+            '^(?i)AccountState$' { $row[$col] = Get-AccountState -User $u -Now $now; break }
+            '^(?i)Email$'        { $row[$col] = $u.mail; break }
+            default              { $row[$col] = $u.$col; break }
         }
     }
-    [void]$results.Add([pscustomobject]$row)
+
+    $results += [pscustomobject]$row
 }
 
-$sorted =
-    if ($outProps -contains 'SamAccountName') {
-        $results | Sort-Object -Property SamAccountName
-    } else {
-        $results
-    }
-
+# Output
 if ($Csv) {
-    $sorted | Select-Object -Property $outProps | ConvertTo-Csv -NoTypeInformation
-    exit 0
+    $text = (@($results | Select-Object -Property $resolvedFields | ConvertTo-Csv -NoTypeInformation)) -join "`r`n"
+    if ($OutFile) { Set-Content -Path $OutFile -Value $text -Encoding utf8 }
+    $text
+    return
 }
 
 if ($Tsv) {
-    $selected = $sorted | Select-Object -Property $outProps
-    ConvertTo-Tsv -InputObject $selected -Properties $outProps
-    exit 0
+    $selected = @($results | Select-Object -Property $resolvedFields)
+    $text = ConvertTo-Tsv -InputObject $selected -Properties $resolvedFields
+    if ($OutFile) { Set-Content -Path $OutFile -Value $text -Encoding utf8 }
+    $text
+    return
 }
 
-$sorted | Select-Object -Property $outProps
+$results | Select-Object -Property $resolvedFields
