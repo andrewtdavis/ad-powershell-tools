@@ -659,83 +659,54 @@ function Get-CdmUserProfileCascade {
     return $null
 }
 
-function Resolve-CdmZoneObject {
+function Get-DelineaProfileForAdUser {
     param(
         [Parameter(Mandatory = $true)]
-        [string]$ZoneInput
+        [Microsoft.ActiveDirectory.Management.ADUser]$AdUser,
+
+        [Parameter(Mandatory = $true)]
+        $Zone,
+
+        [Parameter(Mandatory = $true)]
+        [hashtable]$ZoneByDn,
+
+        [switch]$CascadeLookup
     )
 
-    $allZones = @(Get-CdmZone -ErrorAction Stop)
-    if (-not $allZones -or $allZones.Count -eq 0) {
-        throw "Get-CdmZone returned no zones."
+    $candidates = New-Object System.Collections.Generic.List[string]
+
+    if ($AdUser.UserPrincipalName) {
+        [void]$candidates.Add([string]$AdUser.UserPrincipalName)
     }
 
-    $normalizedInput = ($ZoneInput -replace '\\', '/').Trim().Trim('/')
-
-    # Exact distinguished name
-    $byDn = @(
-        $allZones | Where-Object {
-            $_.DistinguishedName -and $_.DistinguishedName -eq $ZoneInput
-        }
-    )
-    if ($byDn.Count -eq 1) { return $byDn[0] }
-    if ($byDn.Count -gt 1) {
-        throw "Multiple Delinea zones matched distinguished name '$ZoneInput'."
+    if ($AdUser.SamAccountName) {
+        [void]$candidates.Add([string]$AdUser.SamAccountName)
     }
 
-    # Exact canonical path, normalized for slash direction and trailing slash
-    $byCanonical = @(
-        $allZones | Where-Object {
-            $_.CanonicalName -and
-            (($_.CanonicalName -replace '\\', '/').Trim().Trim('/')) -eq $normalizedInput
-        }
-    )
-    if ($byCanonical.Count -eq 1) { return $byCanonical[0] }
-    if ($byCanonical.Count -gt 1) {
-        throw "Multiple Delinea zones matched canonical path '$ZoneInput'."
-    }
-
-    # Exact leaf name
-    $byName = @(
-        $allZones | Where-Object {
-            $_.Name -and $_.Name -eq $ZoneInput
-        }
-    )
-    if ($byName.Count -eq 1) { return $byName[0] }
-    if ($byName.Count -gt 1) {
-        $matches = ($byName | Select-Object -ExpandProperty CanonicalName) -join ', '
-        throw "Multiple Delinea zones matched name '$ZoneInput'. Use a canonical path instead. Matches: $matches"
-    }
-
-    # Exact leaf name from the provided path
-    $leafName = ($normalizedInput -split '/')[(-1)]
-    if ($leafName) {
-        $byLeaf = @(
-            $allZones | Where-Object {
-                $_.Name -and $_.Name -eq $leafName
-            }
-        )
-        if ($byLeaf.Count -eq 1) { return $byLeaf[0] }
-        if ($byLeaf.Count -gt 1) {
-            $matches = ($byLeaf | Select-Object -ExpandProperty CanonicalName) -join ', '
-            throw "Multiple Delinea zones matched leaf name '$leafName'. Use the exact canonical path instead. Matches: $matches"
+    if ($AdUser.SamAccountName -and $AdUser.DistinguishedName) {
+        $userDomain = Get-DomainFromDistinguishedName -DistinguishedName $AdUser.DistinguishedName
+        if ($userDomain) {
+            [void]$candidates.Add(("{0}@{1}" -f $AdUser.SamAccountName, $userDomain))
         }
     }
 
-    # Fuzzy canonical match
-    $byCanonicalLike = @(
-        $allZones | Where-Object {
-            $_.CanonicalName -and
-            (($_.CanonicalName -replace '\\', '/').Trim().Trim('/')) -like "*$normalizedInput*"
-        }
+    $uniqueCandidates = @(
+        $candidates |
+        Where-Object { $_ -and $_.Trim().Length -gt 0 } |
+        Select-Object -Unique
     )
-    if ($byCanonicalLike.Count -eq 1) { return $byCanonicalLike[0] }
-    if ($byCanonicalLike.Count -gt 1) {
-        $matches = ($byCanonicalLike | Select-Object -ExpandProperty CanonicalName) -join ', '
-        throw "Multiple Delinea zones loosely matched '$ZoneInput'. Matches: $matches"
+
+    foreach ($candidate in $uniqueCandidates) {
+        if ($CascadeLookup) {
+            $profile = Get-CdmUserProfileCascade -StartZone $Zone -UserName $candidate -ZoneByDn $ZoneByDn
+        } else {
+            $profile = Get-CdmUserProfileSafe -Zone $Zone -UserName $candidate
+        }
+
+        if ($profile) { return $profile }
     }
 
-    throw "Failed to resolve Delinea zone '$ZoneInput'."
+    return $null
 }
 
 function Convert-DelineaValueToDisplayString {
