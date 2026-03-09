@@ -763,6 +763,8 @@ if (-not $allZones -or $allZones.Count -eq 0) {
 $resolvedZone = Resolve-CdmZoneObject -ZoneInput $CdmZone
 $zoneByDn = Build-ZoneLookupMap -AllZones $allZones
 
+Write-Verbose ("Resolved Delinea zone '{0}' to '{1}'" -f $CdmZone, $resolvedZone.CanonicalName)
+
 $members = Get-ADGroupMembersCrossDomain -Group $group -DomainList $fallbackDomains
 
 # Build field plan
