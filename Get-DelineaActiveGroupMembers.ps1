@@ -529,7 +529,7 @@ function Resolve-CdmZoneObject {
 
     $normalizedInput = ($ZoneInput -replace '\\', '/').Trim().Trim('/')
 
-    # Exact distinguished name
+    # Exact DN
     $byDn = @(
         $allZones | Where-Object {
             $_.DistinguishedName -and $_.DistinguishedName -eq $ZoneInput
@@ -540,16 +540,17 @@ function Resolve-CdmZoneObject {
         throw "Multiple Delinea zones matched distinguished name '$ZoneInput'."
     }
 
-    # Exact canonical path, normalized for slash direction and trailing slash
-    $byCanonical = @(
+    # Exact canonical name
+    $byCanonicalExact = @(
         $allZones | Where-Object {
             $_.CanonicalName -and
             (($_.CanonicalName -replace '\\', '/').Trim().Trim('/')) -eq $normalizedInput
         }
     )
-    if ($byCanonical.Count -eq 1) { return $byCanonical[0] }
-    if ($byCanonical.Count -gt 1) {
-        throw "Multiple Delinea zones matched canonical path '$ZoneInput'."
+    if ($byCanonicalExact.Count -eq 1) { return $byCanonicalExact[0] }
+    if ($byCanonicalExact.Count -gt 1) {
+        $matches = ($byCanonicalExact | Select-Object -ExpandProperty CanonicalName) -join ', '
+        throw "Multiple Delinea zones matched canonical path '$ZoneInput'. Matches: $matches"
     }
 
     # Exact leaf name
@@ -559,37 +560,37 @@ function Resolve-CdmZoneObject {
         }
     )
     if ($byName.Count -eq 1) { return $byName[0] }
-    if ($byName.Count -gt 1) {
-        $matches = ($byName | Select-Object -ExpandProperty CanonicalName) -join ', '
-        throw "Multiple Delinea zones matched name '$ZoneInput'. Use a canonical path instead. Matches: $matches"
-    }
 
-    # Exact leaf name from the provided path
+    # Leaf name from provided path
     $leafName = ($normalizedInput -split '/')[(-1)]
-    if ($leafName) {
-        $byLeaf = @(
-            $allZones | Where-Object {
-                $_.Name -and $_.Name -eq $leafName
-            }
-        )
-        if ($byLeaf.Count -eq 1) { return $byLeaf[0] }
-        if ($byLeaf.Count -gt 1) {
-            $matches = ($byLeaf | Select-Object -ExpandProperty CanonicalName) -join ', '
-            throw "Multiple Delinea zones matched leaf name '$leafName'. Use the exact canonical path instead. Matches: $matches"
-        }
-    }
-
-    # Fuzzy canonical match
-    $byCanonicalLike = @(
+    $byLeaf = @(
         $allZones | Where-Object {
-            $_.CanonicalName -and
-            (($_.CanonicalName -replace '\\', '/').Trim().Trim('/')) -like "*$normalizedInput*"
+            $_.Name -and $_.Name -eq $leafName
         }
     )
-    if ($byCanonicalLike.Count -eq 1) { return $byCanonicalLike[0] }
-    if ($byCanonicalLike.Count -gt 1) {
-        $matches = ($byCanonicalLike | Select-Object -ExpandProperty CanonicalName) -join ', '
-        throw "Multiple Delinea zones loosely matched '$ZoneInput'. Matches: $matches"
+    if ($byLeaf.Count -eq 1) { return $byLeaf[0] }
+
+    # Fuzzy canonical suffix match
+    $byCanonicalSuffix = @(
+        $allZones | Where-Object {
+            if (-not $_.CanonicalName) { return $false }
+
+            $canon = (($_.CanonicalName -replace '\\', '/').Trim().Trim('/'))
+
+            if ($canon -eq $normalizedInput) { return $true }
+            if ($canon -like "*/$normalizedInput") { return $true }
+
+            return $false
+        }
+    )
+
+    if ($byCanonicalSuffix.Count -eq 1) {
+        return $byCanonicalSuffix[0]
+    }
+
+    if ($byCanonicalSuffix.Count -gt 1) {
+        $matches = ($byCanonicalSuffix | Select-Object -ExpandProperty CanonicalName) -join ', '
+        throw "Multiple Delinea zones matched path suffix '$ZoneInput'. Use a more specific path. Matches: $matches"
     }
 
     throw "Failed to resolve Delinea zone '$ZoneInput'."
@@ -621,7 +622,15 @@ function Get-CdmUserProfileSafe {
     )
 
     try {
-        return Get-CdmUserProfile -Zone $Zone -User $UserName -ErrorAction Stop
+        $zoneArg = $Zone
+
+        if ($Zone -isnot [string]) {
+            if ($Zone.PSObject.Properties.Match('DistinguishedName').Count -gt 0 -and $Zone.DistinguishedName) {
+                $zoneArg = [string]$Zone.DistinguishedName
+            }
+        }
+
+        return Get-CdmUserProfile -Zone $zoneArg -User $UserName -ErrorAction Stop
     } catch {
         return $null
     }
