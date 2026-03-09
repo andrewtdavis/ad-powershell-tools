@@ -523,19 +523,73 @@ function Resolve-CdmZoneObject {
     )
 
     $allZones = @(Get-CdmZone -ErrorAction Stop)
+    if (-not $allZones -or $allZones.Count -eq 0) {
+        throw "Get-CdmZone returned no zones."
+    }
 
-    $byDn = @($allZones | Where-Object { $_.DistinguishedName -eq $ZoneInput })
+    $normalizedInput = ($ZoneInput -replace '\\', '/').Trim().Trim('/')
+
+    # Exact distinguished name
+    $byDn = @(
+        $allZones | Where-Object {
+            $_.DistinguishedName -and $_.DistinguishedName -eq $ZoneInput
+        }
+    )
     if ($byDn.Count -eq 1) { return $byDn[0] }
+    if ($byDn.Count -gt 1) {
+        throw "Multiple Delinea zones matched distinguished name '$ZoneInput'."
+    }
 
-    $byCanonical = @($allZones | Where-Object { $_.CanonicalName -eq $ZoneInput })
+    # Exact canonical path, normalized for slash direction and trailing slash
+    $byCanonical = @(
+        $allZones | Where-Object {
+            $_.CanonicalName -and
+            (($_.CanonicalName -replace '\\', '/').Trim().Trim('/')) -eq $normalizedInput
+        }
+    )
     if ($byCanonical.Count -eq 1) { return $byCanonical[0] }
+    if ($byCanonical.Count -gt 1) {
+        throw "Multiple Delinea zones matched canonical path '$ZoneInput'."
+    }
 
-    $byName = @($allZones | Where-Object { $_.Name -eq $ZoneInput })
+    # Exact leaf name
+    $byName = @(
+        $allZones | Where-Object {
+            $_.Name -and $_.Name -eq $ZoneInput
+        }
+    )
     if ($byName.Count -eq 1) { return $byName[0] }
-
     if ($byName.Count -gt 1) {
         $matches = ($byName | Select-Object -ExpandProperty CanonicalName) -join ', '
-        throw "Multiple Delinea zones matched name '$ZoneInput'. Use the canonical path instead. Matches: $matches"
+        throw "Multiple Delinea zones matched name '$ZoneInput'. Use a canonical path instead. Matches: $matches"
+    }
+
+    # Exact leaf name from the provided path
+    $leafName = ($normalizedInput -split '/')[(-1)]
+    if ($leafName) {
+        $byLeaf = @(
+            $allZones | Where-Object {
+                $_.Name -and $_.Name -eq $leafName
+            }
+        )
+        if ($byLeaf.Count -eq 1) { return $byLeaf[0] }
+        if ($byLeaf.Count -gt 1) {
+            $matches = ($byLeaf | Select-Object -ExpandProperty CanonicalName) -join ', '
+            throw "Multiple Delinea zones matched leaf name '$leafName'. Use the exact canonical path instead. Matches: $matches"
+        }
+    }
+
+    # Fuzzy canonical match
+    $byCanonicalLike = @(
+        $allZones | Where-Object {
+            $_.CanonicalName -and
+            (($_.CanonicalName -replace '\\', '/').Trim().Trim('/')) -like "*$normalizedInput*"
+        }
+    )
+    if ($byCanonicalLike.Count -eq 1) { return $byCanonicalLike[0] }
+    if ($byCanonicalLike.Count -gt 1) {
+        $matches = ($byCanonicalLike | Select-Object -ExpandProperty CanonicalName) -join ', '
+        throw "Multiple Delinea zones loosely matched '$ZoneInput'. Matches: $matches"
     }
 
     throw "Failed to resolve Delinea zone '$ZoneInput'."
