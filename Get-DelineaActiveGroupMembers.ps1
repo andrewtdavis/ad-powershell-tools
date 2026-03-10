@@ -4,80 +4,88 @@
     Enumerate active AD group members across domains and enrich them with Delinea zone attributes.
 
   Description:
-    Retrieves members for the specified AD group, resolves nested group members recursively
-    across domains and forests, filters to active AD users by default, and enriches the
-    results with Delinea user profile attributes from a specified Delinea zone.
+    Resolves an Active Directory group, expands nested group membership recursively across
+    domains, filters to active AD users by default, and optionally enriches the output
+    with Delinea user profile attributes from a specified Delinea zone.
+
+    Delinea behavior:
+      - Delinea cmdlets are only called when a Delinea-backed output field is requested
+      - The Delinea zone is resolved once
+      - The script attempts a one-time zone preload into a local hashtable
+      - If zone preload is not supported by the installed Delinea module, the script
+        falls back to targeted per-user lookups
+      - Positive and negative Delinea lookup results are cached for the duration of the run
+      - If a user is present in the AD group but missing in Delinea, the script flags
+        that as a provisioning gap
 
     AD behavior:
-      - Cross-domain group and user resolution is supported
       - Nested groups are expanded recursively
+      - Cross-domain member resolution is supported
       - Disabled users are excluded by default
       - Expired users are excluded by default
       - Use -IncludeDisabled and/or -IncludeExpired to override
 
-    Delinea behavior:
-      - -CdmZone is required
-      - The zone may be specified by exact name, canonical path, or distinguished name
-      - By default, user profile lookup is attempted only in the specified zone
-      - Use -CascadeZoneLookup to walk parent zones until a profile is found
-
-    Field selection:
-      - AD-backed fields continue to work through -Fields or legacy -Name, -Email, -Attributes
-      - Delinea enrichment fields can be requested through -Fields:
-          * DelineaZone
-          * UnixLogin
-          * UnixUid
-          * UidNumber
-          * PrimaryGroupId
-
     Output:
       - Default output is PowerShell objects
-      - -Csv outputs CSV
-      - -Tsv outputs TSV
+      - -Csv outputs CSV text
+      - -Tsv outputs TSV text
 
   Parameters:
     -GroupName
-      Group name, sAMAccountName, CN, or distinguished name.
+      Group name, sAMAccountName, CN, SID, or distinguished name.
 
     -Domains
       One or more domains or domain controllers to query.
+      The singular alias -Domain is also supported.
 
     -CdmZone
       Delinea zone name, canonical path, or distinguished name.
+      Required only when a Delinea-backed field is requested.
 
     -CascadeZoneLookup
-      Walk parent zones when a Delinea profile is not found in the specified zone.
+      If set, Delinea profile lookup walks parent zones when a profile is not found
+      in the requested zone.
 
     -Fields
-      Optional explicit output columns.
-      Examples:
-        SamAccountName,Name,Email,uidNumber,DelineaZone,UnixLogin,UnixUid,PrimaryGroupId
+      Explicit output columns.
 
-    -Name / -Email / -Attributes
-      Legacy field selection.
+    -Name
+      Include Name in legacy output mode.
+
+    -Email
+      Include Email in legacy output mode.
+
+    -Attributes
+      Additional attributes in legacy output mode.
 
     -IncludeDisabled
-      Include disabled user accounts.
+      Include disabled users.
 
     -IncludeExpired
-      Include expired user accounts.
+      Include expired users.
 
-    -Csv / -Tsv
-      Output as CSV or TSV.
+    -Csv
+      Output as CSV.
+
+    -Tsv
+      Output as TSV.
 
   Examples:
-    .\Get-DelineaActiveGroupMembers.ps1 "Domain Users" -CdmZone "Global Zone/Linux"
+    .\Get-DelineaActiveGroupMembers.ps1 "Example_Group" `
+      -Domain "example.corp.local" `
+      -Fields SamAccountName,Email
 
-    .\Get-DelineaActiveGroupMembers.ps1 "Domain Users" `
-      -CdmZone "Global Zone/Linux" `
+    .\Get-DelineaActiveGroupMembers.ps1 "Example_Group" `
+      -Domain "example.corp.local" `
+      -Fields SamAccountName,Email,UnixUid,DelineaStatus,MissingDelineaAttributes `
+      -CdmZone "Global Zone/Engineering"
+
+    .\Get-DelineaActiveGroupMembers.ps1 "Example_Group" `
+      -Domains "example.corp.local","child.example.corp.local" `
       -Fields SamAccountName,Name,Email,DelineaZone,UnixLogin,UnixUid,PrimaryGroupId `
-      -Tsv
-
-    .\Get-DelineaActiveGroupMembers.ps1 "Example Group" `
-      -Domains "example.com","child.example.com" `
-      -CdmZone "Global Zone/Engineering" `
+      -CdmZone "Engineering" `
       -CascadeZoneLookup `
-      -IncludeDisabled
+      -Tsv
 #>
 
 [CmdletBinding()]
@@ -87,9 +95,10 @@ param(
     [string]$GroupName,
 
     [Parameter(Mandatory = $false)]
+    [Alias('Domain')]
     [string[]]$Domains = @(),
 
-    [Parameter(Mandatory = $true)]
+    [Parameter(Mandatory = $false)]
     [string]$CdmZone,
 
     [Parameter(Mandatory = $false)]
@@ -128,32 +137,13 @@ if ($Csv -and $Tsv) {
 }
 
 Import-Module ActiveDirectory -ErrorAction Stop
-Import-Module Centrify.DirectControl.PowerShell -ErrorAction Stop
 
-# Ensure DistinguishedName is requested when OU or OrganizationalUnit is included in -Fields
-try {
-    if ($Fields) {
-        $fieldTokens = @()
-        foreach ($f in @($Fields)) {
-            if ($null -eq $f) { continue }
-            $s = ([string]$f).Trim()
-            if (-not $s) { continue }
-            if ($s -match ',') { $fieldTokens += ($s -split '\s*,\s*') } else { $fieldTokens += $s }
-        }
-        $fieldTokens = @(
-            $fieldTokens |
-            ForEach-Object { ([string]$_).Trim() } |
-            Where-Object { $_ } |
-            Select-Object -Unique
-        )
+# Delinea module is imported only if Delinea-backed fields are requested
 
-        if ($fieldTokens -match '^(?i)(OU|OrganizationalUnit)$') {
-            if ($Attributes -notcontains 'DistinguishedName') { $Attributes += 'DistinguishedName' }
-        }
-    }
-} catch {
-    # Best-effort only
-}
+$script:DelineaProfileCache = @{}
+$script:DelineaNegativeSentinel = [pscustomobject]@{ __NotFound = $true }
+$script:DelineaZoneIndex = @{}
+$script:DelineaZonePreloadComplete = @{}
 
 function Get-ParentDn {
     param(
@@ -202,7 +192,8 @@ function Get-FallbackDomainList {
     if ($null -ne $ExplicitDomains) {
         $explicitList = @($ExplicitDomains) |
             Where-Object { $_ -and ([string]$_).Trim().Length -gt 0 } |
-            ForEach-Object { ([string]$_).Trim() }
+            ForEach-Object { ([string]$_).Trim() } |
+            Select-Object -Unique
     }
 
     if (@($explicitList).Count -gt 0) {
@@ -215,53 +206,10 @@ function Get-FallbackDomainList {
             return [string[]]@($forest.Domains)
         }
     } catch {
-        # ignore
+        # Best-effort only
     }
 
     return @()
-}
-
-function Get-ADUserCrossDomain {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$DistinguishedName,
-
-        [Parameter(Mandatory = $true)]
-        [string[]]$Properties,
-
-        [Parameter(Mandatory = $true)]
-        [object]$FallbackDomains
-    )
-
-    $tryList = New-Object System.Collections.Generic.List[string]
-
-    $dnDomain = Get-DomainFromDistinguishedName -DistinguishedName $DistinguishedName
-    if ($dnDomain) { [void]$tryList.Add($dnDomain) }
-
-    $fallbackList = @()
-    if ($null -ne $FallbackDomains) { $fallbackList = @($FallbackDomains) }
-
-    foreach ($d in $fallbackList) {
-        if (-not $d) { continue }
-        $ds = ([string]$d).Trim()
-        if (-not $ds) { continue }
-        if (-not $tryList.Contains($ds)) { [void]$tryList.Add($ds) }
-    }
-
-    if ($tryList.Count -eq 0) {
-        try { return Get-ADUser -Identity $DistinguishedName -Properties $Properties }
-        catch { return $null }
-    }
-
-    foreach ($tryDomain in $tryList) {
-        try {
-            return Get-ADUser -Server $tryDomain -Identity $DistinguishedName -Properties $Properties
-        } catch {
-            continue
-        }
-    }
-
-    return $null
 }
 
 function Resolve-ADGroupCrossDomain {
@@ -337,6 +285,104 @@ function Get-ADGroupMembersCrossDomain {
     throw "Failed to enumerate members for group '$($Group.Name)'."
 }
 
+function Get-ADUserCrossDomain {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$DistinguishedName,
+
+        [Parameter(Mandatory = $true)]
+        [string[]]$Properties,
+
+        [Parameter(Mandatory = $true)]
+        [object]$FallbackDomains
+    )
+
+    $tryList = New-Object System.Collections.Generic.List[string]
+
+    $dnDomain = Get-DomainFromDistinguishedName -DistinguishedName $DistinguishedName
+    if ($dnDomain) { [void]$tryList.Add($dnDomain) }
+
+    $fallbackList = @()
+    if ($null -ne $FallbackDomains) { $fallbackList = @($FallbackDomains) }
+
+    foreach ($d in $fallbackList) {
+        if (-not $d) { continue }
+        $ds = ([string]$d).Trim()
+        if (-not $ds) { continue }
+        if (-not $tryList.Contains($ds)) { [void]$tryList.Add($ds) }
+    }
+
+    if ($tryList.Count -eq 0) {
+        try { return Get-ADUser -Identity $DistinguishedName -Properties $Properties }
+        catch { return $null }
+    }
+
+    foreach ($tryDomain in $tryList) {
+        try {
+            return Get-ADUser -Server $tryDomain -Identity $DistinguishedName -Properties $Properties
+        } catch {
+            continue
+        }
+    }
+
+    return $null
+}
+
+function Normalize-UniqueNonEmpty {
+    param([string[]]$Values)
+
+    if (-not $Values) { return @() }
+
+    return @(
+        $Values |
+        Where-Object { $_ -and $_.Trim().Length -gt 0 } |
+        ForEach-Object { $_.Trim() } |
+        Select-Object -Unique
+    )
+}
+
+function Convert-ADValueToDisplayString {
+    param([AllowNull()][object]$Value)
+
+    if ($null -eq $Value) { return $null }
+
+    if ($Value -is [byte[]]) {
+        return ("BINARY ({0} bytes)" -f $Value.Length)
+    }
+
+    if (($Value -is [System.Collections.IEnumerable]) -and -not ($Value -is [string])) {
+        $items = @()
+        foreach ($item in $Value) {
+            if ($null -eq $item) { continue }
+            if ($item -is [byte[]]) {
+                $items += ("BINARY ({0} bytes)" -f $item.Length)
+            } else {
+                $items += [string]$item
+            }
+        }
+        return ($items -join '; ')
+    }
+
+    return [string]$Value
+}
+
+function Convert-DelineaValueToDisplayString {
+    param([AllowNull()][object]$Value)
+
+    if ($null -eq $Value) { return $null }
+
+    if (($Value -is [System.Collections.IEnumerable]) -and -not ($Value -is [string])) {
+        $items = @()
+        foreach ($item in $Value) {
+            if ($null -eq $item) { continue }
+            $items += [string]$item
+        }
+        return ($items -join '; ')
+    }
+
+    return [string]$Value
+}
+
 function ConvertTo-Tsv {
     param(
         [Parameter(Mandatory = $true)]
@@ -369,40 +415,31 @@ function ConvertTo-Tsv {
     return ($lines -join "`r`n")
 }
 
-function Normalize-UniqueNonEmpty {
-    param([string[]]$Values)
-    if (-not $Values) { return @() }
-    $Values |
-        Where-Object { $_ -and $_.Trim().Length -gt 0 } |
-        ForEach-Object { $_.Trim() } |
-        Select-Object -Unique
-}
+function Test-UserIsActive {
+    param(
+        [Parameter(Mandatory = $true)]
+        [Microsoft.ActiveDirectory.Management.ADUser]$UserObject,
 
-function Convert-ADValueToDisplayString {
-    <#
-      Normalizes AD property values for table, CSV, or TSV output.
-      - Multi-valued collections become a '; ' joined string.
-      - Byte arrays become "BINARY (N bytes)".
-    #>
-    param([AllowNull()][object]$Value)
+        [switch]$IncludeDisabled,
+        [switch]$IncludeExpired
+    )
 
-    if ($null -eq $Value) { return $null }
-
-    if ($Value -is [byte[]]) {
-        return ("BINARY ({0} bytes)" -f $Value.Length)
-    }
-
-    if (($Value -is [System.Collections.IEnumerable]) -and -not ($Value -is [string])) {
-        $items = @()
-        foreach ($item in $Value) {
-            if ($null -eq $item) { continue }
-            if ($item -is [byte[]]) { $items += ("BINARY ({0} bytes)" -f $item.Length) }
-            else { $items += [string]$item }
+    if (-not $IncludeDisabled) {
+        if ($UserObject.PSObject.Properties.Match('Enabled').Count -gt 0) {
+            if ($UserObject.Enabled -eq $false) { return $false }
         }
-        return ($items -join '; ')
     }
 
-    return [string]$Value
+    if (-not $IncludeExpired) {
+        if ($UserObject.PSObject.Properties.Match('AccountExpirationDate').Count -gt 0) {
+            $aed = $UserObject.AccountExpirationDate
+            if ($aed -is [DateTime]) {
+                if ($aed -lt (Get-Date)) { return $false }
+            }
+        }
+    }
+
+    return $true
 }
 
 function Build-FieldPlan {
@@ -435,15 +472,17 @@ function Build-FieldPlan {
     if (@($explicit).Count -gt 0) {
         foreach ($f in $explicit) {
             switch -Regex ($f) {
-                '^(?i)samaccountname$'      { & $addColumn 'SamAccountName' 'SamAccountName' }
-                '^(?i)name$'                { & $addColumn 'Name' 'Name' }
-                '^(?i)email$'               { & $addColumn 'Email' 'mail' }
-                '^(?i)(OU|OrganizationalUnit)$' { & $addColumn 'OU' 'DistinguishedName' }
-                '^(?i)DelineaZone$'         { & $addColumn 'DelineaZone' $null }
-                '^(?i)UnixLogin$'           { & $addColumn 'UnixLogin' $null }
-                '^(?i)(UnixUid|UidNumber)$' { & $addColumn 'UnixUid' $null }
-                '^(?i)PrimaryGroupId$'      { & $addColumn 'PrimaryGroupId' $null }
-                default                     { & $addColumn $f $f }
+                '^(?i)samaccountname$'                 { & $addColumn 'SamAccountName' 'SamAccountName' }
+                '^(?i)name$'                           { & $addColumn 'Name' 'Name' }
+                '^(?i)(email|mail)$'                   { & $addColumn 'Email' 'mail' }
+                '^(?i)(OU|OrganizationalUnit)$'        { & $addColumn 'OU' 'DistinguishedName' }
+                '^(?i)DelineaZone$'                    { & $addColumn 'DelineaZone' $null }
+                '^(?i)UnixLogin$'                      { & $addColumn 'UnixLogin' $null }
+                '^(?i)(UnixUid|UidNumber)$'            { & $addColumn 'UnixUid' $null }
+                '^(?i)PrimaryGroupId$'                 { & $addColumn 'PrimaryGroupId' $null }
+                '^(?i)DelineaStatus$'                  { & $addColumn 'DelineaStatus' $null }
+                '^(?i)MissingDelineaAttributes$'       { & $addColumn 'MissingDelineaAttributes' $null }
+                default                                { & $addColumn $f $f }
             }
         }
 
@@ -473,8 +512,14 @@ function Build-FieldPlan {
 
     foreach ($p in $extras) {
         switch -Regex ($p) {
-            '^(?i)(OU|OrganizationalUnit)$' { & $addColumn 'OU' 'DistinguishedName' | Out-Null }
-            default                         { & $addColumn $p $p | Out-Null }
+            '^(?i)(OU|OrganizationalUnit)$'        { & $addColumn 'OU' 'DistinguishedName' | Out-Null }
+            '^(?i)DelineaZone$'                    { & $addColumn 'DelineaZone' $null | Out-Null }
+            '^(?i)UnixLogin$'                      { & $addColumn 'UnixLogin' $null | Out-Null }
+            '^(?i)(UnixUid|UidNumber)$'            { & $addColumn 'UnixUid' $null | Out-Null }
+            '^(?i)PrimaryGroupId$'                 { & $addColumn 'PrimaryGroupId' $null | Out-Null }
+            '^(?i)DelineaStatus$'                  { & $addColumn 'DelineaStatus' $null | Out-Null }
+            '^(?i)MissingDelineaAttributes$'       { & $addColumn 'MissingDelineaAttributes' $null | Out-Null }
+            default                                { & $addColumn $p $p | Out-Null }
         }
     }
 
@@ -486,34 +531,48 @@ function Build-FieldPlan {
     }
 }
 
-function Test-UserIsActive {
-    <#
-      Returns $true if the account should be included, based on Enabled and expiration filters.
-    #>
+function Test-NeedsDelineaLookup {
     param(
         [Parameter(Mandatory = $true)]
-        [Microsoft.ActiveDirectory.Management.ADUser]$UserObject,
-
-        [switch]$IncludeDisabled,
-        [switch]$IncludeExpired
+        [string[]]$Columns
     )
 
-    if (-not $IncludeDisabled) {
-        if ($UserObject.PSObject.Properties.Match('Enabled').Count -gt 0) {
-            if ($UserObject.Enabled -eq $false) { return $false }
+    foreach ($c in @($Columns)) {
+        if ($c -match '^(?i)(DelineaZone|UnixLogin|UnixUid|UidNumber|PrimaryGroupId|DelineaStatus|MissingDelineaAttributes)$') {
+            return $true
         }
     }
 
-    if (-not $IncludeExpired) {
-        if ($UserObject.PSObject.Properties.Match('AccountExpirationDate').Count -gt 0) {
-            $aed = $UserObject.AccountExpirationDate
-            if ($aed -is [DateTime]) {
-                if ($aed -lt (Get-Date)) { return $false }
-            }
-        }
+    return $false
+}
+
+function Initialize-DelineaCaches {
+    $script:DelineaProfileCache = @{}
+    $script:DelineaZoneIndex = @{}
+    $script:DelineaZonePreloadComplete = @{}
+}
+
+function Get-DelineaZoneKey {
+    param(
+        [Parameter(Mandatory = $true)]
+        $Zone
+    )
+
+    if ($Zone -is [string]) { return $Zone }
+
+    if ($Zone.PSObject.Properties.Match('DistinguishedName').Count -gt 0 -and $Zone.DistinguishedName) {
+        return [string]$Zone.DistinguishedName
     }
 
-    return $true
+    if ($Zone.PSObject.Properties.Match('CanonicalName').Count -gt 0 -and $Zone.CanonicalName) {
+        return [string]$Zone.CanonicalName
+    }
+
+    if ($Zone.PSObject.Properties.Match('Name').Count -gt 0 -and $Zone.Name) {
+        return [string]$Zone.Name
+    }
+
+    return [string]$Zone
 }
 
 function Resolve-CdmZoneObject {
@@ -529,7 +588,6 @@ function Resolve-CdmZoneObject {
 
     $normalizedInput = ($ZoneInput -replace '\\', '/').Trim().Trim('/')
 
-    # Exact DN
     $byDn = @(
         $allZones | Where-Object {
             $_.DistinguishedName -and $_.DistinguishedName -eq $ZoneInput
@@ -540,7 +598,6 @@ function Resolve-CdmZoneObject {
         throw "Multiple Delinea zones matched distinguished name '$ZoneInput'."
     }
 
-    # Exact canonical name
     $byCanonicalExact = @(
         $allZones | Where-Object {
             $_.CanonicalName -and
@@ -553,7 +610,6 @@ function Resolve-CdmZoneObject {
         throw "Multiple Delinea zones matched canonical path '$ZoneInput'. Matches: $matches"
     }
 
-    # Exact leaf name
     $byName = @(
         $allZones | Where-Object {
             $_.Name -and $_.Name -eq $ZoneInput
@@ -561,7 +617,6 @@ function Resolve-CdmZoneObject {
     )
     if ($byName.Count -eq 1) { return $byName[0] }
 
-    # Leaf name from provided path
     $leafName = ($normalizedInput -split '/')[(-1)]
     $byLeaf = @(
         $allZones | Where-Object {
@@ -570,7 +625,6 @@ function Resolve-CdmZoneObject {
     )
     if ($byLeaf.Count -eq 1) { return $byLeaf[0] }
 
-    # Fuzzy canonical suffix match
     $byCanonicalSuffix = @(
         $allZones | Where-Object {
             if (-not $_.CanonicalName) { return $false }
@@ -591,6 +645,11 @@ function Resolve-CdmZoneObject {
     if ($byCanonicalSuffix.Count -gt 1) {
         $matches = ($byCanonicalSuffix | Select-Object -ExpandProperty CanonicalName) -join ', '
         throw "Multiple Delinea zones matched path suffix '$ZoneInput'. Use a more specific path. Matches: $matches"
+    }
+
+    if ($byLeaf.Count -gt 1) {
+        $matches = ($byLeaf | Select-Object -ExpandProperty CanonicalName) -join ', '
+        throw "Multiple Delinea zones matched leaf name '$leafName'. Use a more specific path. Matches: $matches"
     }
 
     throw "Failed to resolve Delinea zone '$ZoneInput'."
@@ -668,6 +727,182 @@ function Get-CdmUserProfileCascade {
     return $null
 }
 
+function New-DelineaIdentityKeysForAdUser {
+    param(
+        [Parameter(Mandatory = $true)]
+        [Microsoft.ActiveDirectory.Management.ADUser]$AdUser
+    )
+
+    $keys = New-Object System.Collections.Generic.List[string]
+
+    if ($AdUser.SID) {
+        [void]$keys.Add(("SID:{0}" -f [string]$AdUser.SID))
+    }
+
+    if ($AdUser.UserPrincipalName) {
+        [void]$keys.Add(("UPN:{0}" -f [string]$AdUser.UserPrincipalName).ToLowerInvariant())
+    }
+
+    if ($AdUser.SamAccountName) {
+        [void]$keys.Add(("SAM:{0}" -f [string]$AdUser.SamAccountName).ToLowerInvariant())
+    }
+
+    if ($AdUser.DistinguishedName) {
+        [void]$keys.Add(("DN:{0}" -f [string]$AdUser.DistinguishedName).ToLowerInvariant())
+
+        $userDomain = Get-DomainFromDistinguishedName -DistinguishedName $AdUser.DistinguishedName
+        if ($userDomain -and $AdUser.SamAccountName) {
+            [void]$keys.Add(("UPN:{0}" -f ("{0}@{1}" -f $AdUser.SamAccountName, $userDomain)).ToLowerInvariant())
+        }
+
+        $cnPart = ([string]$AdUser.DistinguishedName -split ',')[0]
+        if ($cnPart -match '^(?i)CN=(.+)$') {
+            [void]$keys.Add(("CN:{0}" -f $Matches[1]).ToLowerInvariant())
+        }
+    }
+
+    return @($keys | Select-Object -Unique)
+}
+
+function Get-DelineaCachedProfileByKeys {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ZoneKey,
+
+        [Parameter(Mandatory = $true)]
+        [string[]]$IdentityKeys
+    )
+
+    foreach ($k in @($IdentityKeys)) {
+        $fullKey = ("{0}|{1}" -f $ZoneKey.ToLowerInvariant(), $k)
+        if ($script:DelineaProfileCache.ContainsKey($fullKey)) {
+            return $script:DelineaProfileCache[$fullKey]
+        }
+    }
+
+    return $null
+}
+
+function Set-DelineaCachedProfileByKeys {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ZoneKey,
+
+        [Parameter(Mandatory = $true)]
+        [string[]]$IdentityKeys,
+
+        [AllowNull()]
+        $Profile
+    )
+
+    foreach ($k in @($IdentityKeys)) {
+        $fullKey = ("{0}|{1}" -f $ZoneKey.ToLowerInvariant(), $k)
+        if ($null -eq $Profile) {
+            $script:DelineaProfileCache[$fullKey] = $script:DelineaNegativeSentinel
+        } else {
+            $script:DelineaProfileCache[$fullKey] = $Profile
+        }
+    }
+}
+
+function Add-DelineaProfileToZoneIndex {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ZoneKey,
+
+        [Parameter(Mandatory = $true)]
+        $Profile
+    )
+
+    if (-not $script:DelineaZoneIndex.ContainsKey($ZoneKey)) {
+        $script:DelineaZoneIndex[$ZoneKey] = @{}
+    }
+
+    $index = $script:DelineaZoneIndex[$ZoneKey]
+    $keys = New-Object System.Collections.Generic.List[string]
+
+    if ($Profile.PSObject.Properties.Match('Sid').Count -gt 0 -and $Profile.Sid) {
+        [void]$keys.Add(("SID:{0}" -f [string]$Profile.Sid))
+    }
+
+    if ($Profile.PSObject.Properties.Match('User').Count -gt 0 -and $Profile.User) {
+        [void]$keys.Add(("UPN:{0}" -f [string]$Profile.User).ToLowerInvariant())
+        [void]$keys.Add(("SAM:{0}" -f [string]$Profile.User).ToLowerInvariant())
+    }
+
+    if ($Profile.PSObject.Properties.Match('Name').Count -gt 0 -and $Profile.Name) {
+        [void]$keys.Add(("SAM:{0}" -f [string]$Profile.Name).ToLowerInvariant())
+        [void]$keys.Add(("CN:{0}" -f [string]$Profile.Name).ToLowerInvariant())
+    }
+
+    if ($Profile.PSObject.Properties.Match('DistinguishedName').Count -gt 0 -and $Profile.DistinguishedName) {
+        [void]$keys.Add(("DN:{0}" -f [string]$Profile.DistinguishedName).ToLowerInvariant())
+    }
+
+    foreach ($k in @($keys | Select-Object -Unique)) {
+        $index[$k] = $Profile
+    }
+}
+
+function Get-DelineaProfileFromZoneIndex {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ZoneKey,
+
+        [Parameter(Mandatory = $true)]
+        [string[]]$IdentityKeys
+    )
+
+    if (-not $script:DelineaZoneIndex.ContainsKey($ZoneKey)) {
+        return $null
+    }
+
+    $index = $script:DelineaZoneIndex[$ZoneKey]
+    foreach ($k in @($IdentityKeys)) {
+        if ($index.ContainsKey($k)) {
+            return $index[$k]
+        }
+    }
+
+    return $null
+}
+
+function Initialize-DelineaZoneIndex {
+    param(
+        [Parameter(Mandatory = $true)]
+        $Zone
+    )
+
+    $zoneKey = Get-DelineaZoneKey -Zone $Zone
+
+    if ($script:DelineaZonePreloadComplete.ContainsKey($zoneKey)) {
+        return
+    }
+
+    $script:DelineaZonePreloadComplete[$zoneKey] = $true
+
+    Write-Verbose ("Attempting Delinea zone preload for '{0}'" -f $zoneKey)
+
+    try {
+        $zoneArg = $Zone
+        if ($Zone -isnot [string]) {
+            if ($Zone.PSObject.Properties.Match('DistinguishedName').Count -gt 0 -and $Zone.DistinguishedName) {
+                $zoneArg = [string]$Zone.DistinguishedName
+            }
+        }
+
+        $profiles = @(Get-CdmUserProfile -Zone $zoneArg -ErrorAction Stop)
+
+        foreach ($p in @($profiles)) {
+            Add-DelineaProfileToZoneIndex -ZoneKey $zoneKey -Profile $p
+        }
+
+        Write-Verbose ("Preloaded {0} Delinea profiles for zone '{1}'" -f @($profiles).Count, $zoneKey)
+    } catch {
+        Write-Verbose ("Zone preload not available for '{0}'. Falling back to targeted Delinea lookups. Error: {1}" -f $zoneKey, $_.Exception.Message)
+    }
+}
+
 function Get-DelineaProfileForAdUser {
     param(
         [Parameter(Mandatory = $true)]
@@ -681,6 +916,23 @@ function Get-DelineaProfileForAdUser {
 
         [switch]$CascadeLookup
     )
+
+    $zoneKey = Get-DelineaZoneKey -Zone $Zone
+    $identityKeys = New-DelineaIdentityKeysForAdUser -AdUser $AdUser
+
+    $cached = Get-DelineaCachedProfileByKeys -ZoneKey $zoneKey -IdentityKeys $identityKeys
+    if ($cached) {
+        if ($cached.PSObject.Properties.Match('__NotFound').Count -gt 0) {
+            return $null
+        }
+        return $cached
+    }
+
+    $preloaded = Get-DelineaProfileFromZoneIndex -ZoneKey $zoneKey -IdentityKeys $identityKeys
+    if ($preloaded) {
+        Set-DelineaCachedProfileByKeys -ZoneKey $zoneKey -IdentityKeys $identityKeys -Profile $preloaded
+        return $preloaded
+    }
 
     $candidates = New-Object System.Collections.Generic.List[string]
 
@@ -699,46 +951,35 @@ function Get-DelineaProfileForAdUser {
         }
     }
 
-    $uniqueCandidates = @(
+    $candidates = @(
         $candidates |
         Where-Object { $_ -and $_.Trim().Length -gt 0 } |
         Select-Object -Unique
     )
 
-    foreach ($candidate in $uniqueCandidates) {
+    foreach ($candidate in @($candidates)) {
+        $profile = $null
+
         if ($CascadeLookup) {
             $profile = Get-CdmUserProfileCascade -StartZone $Zone -UserName $candidate -ZoneByDn $ZoneByDn
         } else {
             $profile = Get-CdmUserProfileSafe -Zone $Zone -UserName $candidate
         }
 
-        if ($profile) { return $profile }
-    }
-
-    return $null
-}
-
-function Convert-DelineaValueToDisplayString {
-    param([AllowNull()][object]$Value)
-
-    if ($null -eq $Value) { return $null }
-
-    if (($Value -is [System.Collections.IEnumerable]) -and -not ($Value -is [string])) {
-        $items = @()
-        foreach ($item in $Value) {
-            if ($null -eq $item) { continue }
-            $items += [string]$item
+        if ($profile) {
+            Set-DelineaCachedProfileByKeys -ZoneKey $zoneKey -IdentityKeys $identityKeys -Profile $profile
+            return $profile
         }
-        return ($items -join '; ')
     }
 
-    return [string]$Value
+    Set-DelineaCachedProfileByKeys -ZoneKey $zoneKey -IdentityKeys $identityKeys -Profile $null
+    return $null
 }
 
 # Build domain list
 $fallbackDomains = Get-FallbackDomainList -ExplicitDomains $Domains
 
-# Resolve AD group across domains
+# Resolve AD group
 $group = $null
 try {
     $group = Resolve-ADGroupCrossDomain -Identity $GroupName -DomainList $fallbackDomains
@@ -754,18 +995,11 @@ if (-not $group) {
     throw "Failed to resolve group '$GroupName' in the current domain context, and domain discovery was not available. Specify -Domains for cross-domain resolution."
 }
 
-# Resolve Delinea zone
-$allZones = @(Get-CdmZone -ErrorAction Stop)
-if (-not $allZones -or $allZones.Count -eq 0) {
-    throw "Get-CdmZone returned no zones."
-}
+Write-Verbose ("Resolved AD group '{0}'" -f $group.Name)
 
-$resolvedZone = Resolve-CdmZoneObject -ZoneInput $CdmZone
-$zoneByDn = Build-ZoneLookupMap -AllZones $allZones
-
-Write-Verbose ("Resolved Delinea zone '{0}' to '{1}'" -f $CdmZone, $resolvedZone.CanonicalName)
-
+# Enumerate group members
 $members = Get-ADGroupMembersCrossDomain -Group $group -DomainList $fallbackDomains
+Write-Verbose ("Enumerated {0} raw group member objects" -f @($members).Count)
 
 # Build field plan
 $fieldPlan = Build-FieldPlan -ExplicitFields $Fields -LegacyName:$Name -LegacyEmail:$Email -LegacyAttributes $Attributes
@@ -773,12 +1007,39 @@ $outProps = $fieldPlan.OutColumns
 $adProps = $fieldPlan.AdProps
 $colToProp = $fieldPlan.ColumnToAdProp
 
-# Always request these for AD filtering and Delinea lookup
-$requiredForProcessing = @('Enabled', 'AccountExpirationDate', 'UserPrincipalName', 'DistinguishedName', 'SamAccountName')
+# Always request these for processing
+$requiredForProcessing = @('Enabled', 'AccountExpirationDate', 'UserPrincipalName', 'DistinguishedName', 'SamAccountName', 'SID')
 foreach ($rf in $requiredForProcessing) {
     if ($adProps -notcontains $rf) {
         $adProps = @($adProps + $rf)
     }
+}
+
+$needsDelineaLookup = Test-NeedsDelineaLookup -Columns $outProps
+Initialize-DelineaCaches
+
+$allZones = @()
+$resolvedZone = $null
+$zoneByDn = @{}
+
+if ($needsDelineaLookup) {
+    if (-not $CdmZone) {
+        throw "Parameter -CdmZone is required when Delinea-backed fields are requested."
+    }
+
+    Import-Module Centrify.DirectControl.PowerShell -ErrorAction Stop
+
+    $allZones = @(Get-CdmZone -ErrorAction Stop)
+    if (-not $allZones -or $allZones.Count -eq 0) {
+        throw "Get-CdmZone returned no zones."
+    }
+
+    $resolvedZone = Resolve-CdmZoneObject -ZoneInput $CdmZone
+    $zoneByDn = Build-ZoneLookupMap -AllZones $allZones
+
+    Write-Verbose ("Resolved Delinea zone '{0}' to '{1}'" -f $CdmZone, $resolvedZone.CanonicalName)
+
+    Initialize-DelineaZoneIndex -Zone $resolvedZone
 }
 
 # Determine whether structured output is needed
@@ -790,11 +1051,23 @@ if ($fieldPlan.UsesExplicit) {
 }
 if ($Csv -or $Tsv) { $needsStructured = $true }
 
-# Username-only mode if nothing else is requested
+# Username-only mode
 if (-not $needsStructured) {
     $namesOnly = New-Object System.Collections.Generic.List[string]
 
-    foreach ($m in @($members)) {
+    $memberList = @($members)
+    $memberTotal = $memberList.Count
+    $memberIndex = 0
+
+    foreach ($m in $memberList) {
+        $memberIndex++
+
+        if (($memberIndex % 50) -eq 0 -or $memberIndex -eq 1 -or $memberIndex -eq $memberTotal) {
+            Write-Progress -Activity "Resolving AD group members" `
+                -Status ("Processing {0} of {1}" -f $memberIndex, $memberTotal) `
+                -PercentComplete (($memberIndex / [math]::Max($memberTotal, 1)) * 100)
+        }
+
         if ($m.objectClass -ne 'user') { continue }
         if (-not $m.DistinguishedName) { continue }
 
@@ -810,6 +1083,7 @@ if (-not $needsStructured) {
         }
     }
 
+    Write-Progress -Activity "Resolving AD group members" -Completed
     $namesOnly | Sort-Object -Unique
     exit 0
 }
@@ -817,7 +1091,19 @@ if (-not $needsStructured) {
 # Structured output
 $results = New-Object System.Collections.Generic.List[object]
 
-foreach ($m in @($members)) {
+$memberList = @($members)
+$memberTotal = $memberList.Count
+$memberIndex = 0
+
+foreach ($m in $memberList) {
+    $memberIndex++
+
+    if (($memberIndex % 25) -eq 0 -or $memberIndex -eq 1 -or $memberIndex -eq $memberTotal) {
+        Write-Progress -Activity "Resolving AD and Delinea users" `
+            -Status ("Processing {0} of {1}" -f $memberIndex, $memberTotal) `
+            -PercentComplete (($memberIndex / [math]::Max($memberTotal, 1)) * 100)
+    }
+
     if ($m.objectClass -ne 'user') { continue }
     if (-not $m.DistinguishedName) { continue }
 
@@ -828,7 +1114,21 @@ foreach ($m in @($members)) {
         continue
     }
 
-    $delineaProfile = Get-DelineaProfileForAdUser -AdUser $u -Zone $resolvedZone -ZoneByDn $zoneByDn -CascadeLookup:$CascadeZoneLookup
+    $delineaProfile = $null
+    $delineaStatus = $null
+    $missingDelineaAttributes = $false
+
+    if ($needsDelineaLookup) {
+        $delineaProfile = Get-DelineaProfileForAdUser -AdUser $u -Zone $resolvedZone -ZoneByDn $zoneByDn -CascadeLookup:$CascadeZoneLookup
+
+        if ($delineaProfile) {
+            $delineaStatus = 'Present'
+            $missingDelineaAttributes = $false
+        } else {
+            $delineaStatus = 'Missing profile in Delinea provisioning zone'
+            $missingDelineaAttributes = $true
+        }
+    }
 
     $row = [ordered]@{}
     foreach ($col in $outProps) {
@@ -842,47 +1142,47 @@ foreach ($m in @($members)) {
             }
 
             '^(?i)DelineaZone$' {
-                if ($resolvedZone.CanonicalName) {
-                    $row[$col] = [string]$resolvedZone.CanonicalName
+                if ($needsDelineaLookup) {
+                    if ($resolvedZone.CanonicalName) {
+                        $row[$col] = [string]$resolvedZone.CanonicalName
+                    } else {
+                        $row[$col] = [string]$resolvedZone.Name
+                    }
                 } else {
-                    $row[$col] = [string]$resolvedZone.Name
+                    $row[$col] = $null
                 }
             }
 
             '^(?i)UnixLogin$' {
-                if ($delineaProfile) {
-                    if ($delineaProfile.PSObject.Properties.Match('Name').Count -gt 0) {
-                        $row[$col] = Convert-DelineaValueToDisplayString -Value $delineaProfile.Name
-                    } else {
-                        $row[$col] = $null
-                    }
+                if ($delineaProfile -and $delineaProfile.PSObject.Properties.Match('Name').Count -gt 0) {
+                    $row[$col] = Convert-DelineaValueToDisplayString -Value $delineaProfile.Name
                 } else {
                     $row[$col] = $null
                 }
             }
 
             '^(?i)(UnixUid|UidNumber)$' {
-                if ($delineaProfile) {
-                    if ($delineaProfile.PSObject.Properties.Match('Uid').Count -gt 0) {
-                        $row[$col] = Convert-DelineaValueToDisplayString -Value $delineaProfile.Uid
-                    } else {
-                        $row[$col] = $null
-                    }
+                if ($delineaProfile -and $delineaProfile.PSObject.Properties.Match('Uid').Count -gt 0) {
+                    $row[$col] = Convert-DelineaValueToDisplayString -Value $delineaProfile.Uid
                 } else {
                     $row[$col] = $null
                 }
             }
 
             '^(?i)PrimaryGroupId$' {
-                if ($delineaProfile) {
-                    if ($delineaProfile.PSObject.Properties.Match('PrimaryGroupId').Count -gt 0) {
-                        $row[$col] = Convert-DelineaValueToDisplayString -Value $delineaProfile.PrimaryGroupId
-                    } else {
-                        $row[$col] = $null
-                    }
+                if ($delineaProfile -and $delineaProfile.PSObject.Properties.Match('PrimaryGroupId').Count -gt 0) {
+                    $row[$col] = Convert-DelineaValueToDisplayString -Value $delineaProfile.PrimaryGroupId
                 } else {
                     $row[$col] = $null
                 }
+            }
+
+            '^(?i)DelineaStatus$' {
+                $row[$col] = $delineaStatus
+            }
+
+            '^(?i)MissingDelineaAttributes$' {
+                $row[$col] = $missingDelineaAttributes
             }
 
             default {
@@ -895,7 +1195,8 @@ foreach ($m in @($members)) {
     [void]$results.Add([pscustomobject]$row)
 }
 
-# Sort and unique by SamAccountName
+Write-Progress -Activity "Resolving AD and Delinea users" -Completed
+
 $sorted = $results | Sort-Object -Property SamAccountName -Unique
 
 if ($Csv) {
